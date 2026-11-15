@@ -29,7 +29,14 @@ class _FaceParsing(FaceParsing):
     (no working-directory tricks or symlinks, which Windows restricts)."""
 
     def model_init(self, *args, **kwargs):
-        return super().model_init(f"{W}/face-parse-bisent/resnet18-5c106cde.pth", f"{W}/face-parse-bisent/79999_iter.pth")
+        # torch>=2.6 defaults torch.load to weights_only=True, which rejects the legacy-.tar resnet18
+        # checkpoint (torchvision's own file, trusted); MuseTalk's resnet.py calls torch.load without the flag.
+        load = torch.load
+        torch.load = lambda *a, **k: load(*a, **{"weights_only": False, **k})
+        try:
+            return super().model_init(f"{W}/face-parse-bisent/resnet18-5c106cde.pth", f"{W}/face-parse-bisent/79999_iter.pth")
+        finally:
+            torch.load = load
 DEFAULT_PHOTO = f"{REPO}/assets/ai-interviewer.png"
 
 

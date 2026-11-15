@@ -35,6 +35,12 @@ class LiveFace:
         self.landmarks = np.load(f"{REPO}/assets/photoreal/{os.path.splitext(os.path.basename(photo))[0]}_landmarks.npy") \
             * (self.W / load_photo(photo).shape[1])          # 68 landmarks on the neutral photo, at stream size
         if compile:
+            try:
+                import triton  # noqa: F401  (torch.compile's GPU backend; not bundled with Windows torch)
+            except ImportError:
+                print("triton not installed - running LivePortrait uncompiled (pip install triton-windows to speed up)", flush=True)
+                compile = False
+        if compile:
             t0 = time.time()
             self.wm = torch.compile(self.wm, mode="max-autotune-no-cudagraphs")
             self.sg = torch.compile(self.sg, mode="max-autotune-no-cudagraphs")
