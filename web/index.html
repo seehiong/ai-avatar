@@ -1,0 +1,2016 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Interviewer</title>
+<!-- Cross-origin isolation (-> multi-threaded WASM for the in-browser voice). The local server sends the
+     COOP/COEP headers itself; on static hosts like GitHub Pages this MIT shim adds them via a service worker. -->
+<script>window.coi = { coepCredentialless: () => true, shouldRegister: () => !window.crossOriginIsolated };</script>
+<script src="coi-serviceworker.js"></script>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%238cf'/></svg>">
+<style>
+  :root { --bg:#1c1e22; --panel:#25282e; --text:#e8eaed; --muted:#9aa0a6; --accent:#8cf; --rec:#e66; --live:#3c6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 system-ui, sans-serif;
+         display:flex; gap:16px; padding:16px; height:100vh; }
+  #left { flex:1.4; display:flex; flex-direction:column; gap:8px; min-width:0; }
+  #tile { position:relative; flex:1; border-radius:12px; overflow:hidden; background:#7d7266; min-height:240px; }
+  #tile canvas { display:block; width:100%; height:100%; }
+  #tile canvas.photo { position:absolute; inset:0; object-fit:cover; object-position:50% 30%; }
+  /* vignette (static); sensor grain only with ?fx=webcam */
+  #tile::after { content:""; position:absolute; inset:0; pointer-events:none;
+                 background:radial-gradient(ellipse at 50% 45%, transparent 55%, rgba(0,0,0,.35) 100%); }
+  #grain { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; opacity:.07; mix-blend-mode:overlay; }
+  #name { position:absolute; left:12px; bottom:10px; text-shadow:0 1px 3px #000a; font-weight:600; z-index:1; }
+  #speaking { position:absolute; inset:0; border-radius:12px; pointer-events:none; z-index:1;
+              box-shadow: inset 0 0 0 3px var(--live); opacity:0; transition:opacity .2s; }
+  #status { color:var(--muted); min-height:1.4em; }
+  #loadPanel { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2; width:min(86%,420px);
+               background:#151719e6; border:1px solid #3a3e45; border-radius:12px; padding:16px; font-size:13px; }
+  #loadTitle { font-weight:600; margin-bottom:8px; } #loadText { color:var(--muted); margin-top:8px; word-break:break-word; }
+  #loadTime { color:#777; margin-top:4px; font-size:12px; }
+  #loadBar { height:6px; background:#2a2d33; border-radius:3px; overflow:hidden; }
+  #loadBar i { display:block; height:100%; width:0; background:var(--accent); transition:width .3s; }
+  #clock { position:absolute; top:12px; right:12px; z-index:1; padding:4px 10px; border-radius:999px; font:600 13px system-ui; background:#0008; font-variant-numeric:tabular-nums; }
+  #clock.warn { color:#ffd27a; } #clock.over { color:#ff9b9b; }
+  #avatarLoading { position:absolute; top:12px; left:12px; z-index:1; padding:4px 10px; border-radius:999px; font-size:13px; background:#0008; }
+  #right { flex:1; display:flex; flex-direction:column; gap:8px; min-width:0; }
+  #log { flex:1; overflow-y:auto; background:var(--panel); border-radius:12px; padding:12px; }
+  #logWrap { position:relative; flex:1; min-height:0; display:flex; }
+  #logWrap #log { flex:1; }
+  #toLatest { position:absolute; right:12px; bottom:10px; padding:4px 12px; font-size:12px; border-radius:999px;
+              background:var(--accent); color:#111; border:0; box-shadow:0 2px 8px #0006; }
+  #log p { margin:0 0 10px; } #log b.cand { color:#9fdc9f; } #log .live { color:var(--muted); font-style:italic; } #log .live::after { content:" ▍"; animation:blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity:0; } } #log b.ai { color:var(--accent); } #log .cut { color:var(--muted); }
+  .row { display:flex; gap:8px; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input, button { font:inherit; color:var(--text); background:var(--panel); border:1px solid #3a3e45;
+                  border-radius:8px; padding:9px 12px; }
+  input { min-width:0; } button { cursor:pointer; } button:hover { border-color:#5a5f68; }
+  [hidden] { display:none !important; }
+  #tabs { display:flex; gap:4px; } .tab { flex:1; padding:7px; } .tab.on { border-color:var(--accent); color:var(--accent); }
+  .tab .step { display:inline-grid; place-items:center; width:18px; height:18px; margin-right:6px; border-radius:50%;
+               border:1px solid currentColor; font-size:11px; line-height:1; }
+  .tab.done:not(.on) .step { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #chat { flex:1; display:flex; flex-direction:column; gap:8px; min-height:0; }
+  #setup { flex:1; overflow-y:auto; background:var(--panel); border-radius:12px; padding:12px; display:flex; flex-direction:column; gap:10px; }
+  #setup .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:8px; }
+  #setup .grid-2 { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:8px; }
+  #setup label { display:flex; flex-direction:column; gap:3px; font-size:12px; color:var(--muted); }
+  #setup input, #setup select, #setup textarea { font:inherit; font-size:14px; color:var(--text); background:var(--bg); border:1px solid #3a3e45; border-radius:6px; padding:6px 8px; }
+  #setup textarea { resize:vertical; } #setup .file input { font-size:12px; padding:2px; border:0; background:none; }
+  #setup .hint { margin:0; font-size:13px; color:var(--muted); } #setup .hint button { margin-left:6px; padding:3px 10px; font-size:12px; } #setup .muted { color:#777; }
+  .setup-card { border:1px solid #353941; border-radius:10px; padding:10px 12px; background:#202328; display:flex; flex-direction:column; gap:8px; margin:0; }
+  .setup-card legend { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.6px; color:var(--accent); padding:0 6px; }
+  .setup-card.engine-pick { border-color:#4b769e; background:#1e242c; }
+  #feedback { flex:1; overflow-y:auto; background:var(--panel); border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:10px; }
+  #feedback h3 { margin:4px 0; font-size:15px; } #feedback ul { margin:4px 0; padding-left:20px; }
+  .rec { display:inline-block; padding:3px 10px; border-radius:999px; font-weight:600; background:#2d3a2f; color:#8fd19e; }
+  .rec.neg { background:#3a2d2d; color:#e6a0a0; } .rec.mid { background:#3a362a; color:#e6cf8f; }
+  .score { border-top:1px solid #3a3e45; padding:8px 0; } .score b { color:var(--text); }
+  .dots { letter-spacing:2px; color:var(--accent); }
+  .delta { font-size:12px; margin-left:6px; color:var(--muted); } .delta.up { color:#4caf50; } .delta.down { color:#e57373; }
+  .hist { display:grid; grid-template-columns: 1fr 1fr 1fr auto auto; gap:8px; align-items:center; padding:6px 0; border-top:1px solid #333; font-size:13px; }
+  #history { margin-top:16px; } #history summary { cursor:pointer; }
+  details.tx { margin-top:8px; } details.tx summary { cursor:pointer; color:var(--accent); } details.tx p { font-size:13px; margin:6px 0; }
+  details.tx b.ai { color:var(--accent); }
+  .score blockquote { margin:4px 0; padding:3px 8px; border-left:3px solid #4a8; font-size:13px; color:var(--text); }
+  .score blockquote.bad { border-color:#c84; color:#d9a77a; } .unv { font-size:11px; color:#d9a77a; border:1px solid #c84; border-radius:4px; padding:0 5px; } .score p { margin:3px 0; font-size:13px; color:var(--muted); }
+  .demo-tag { display:inline-block; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:0.4px;
+              padding:1px 6px; border-radius:4px; margin-right:4px; vertical-align:1px; background:#2b3542; color:#9dc6f7; }
+  .demo-tag.tag-situation { background:#2a3444; color:#9ec5fe; }
+  .demo-tag.tag-task { background:#352f44; color:#c8b6ff; }
+  .demo-tag.tag-action { background:#243b31; color:#8ce0b3; }
+  .demo-tag.tag-result, .demo-tag.tag-metric { background:#3d3522; color:#ffd685; }
+  .demo-tag.tag-tradeoff { background:#442b33; color:#f7a6ba; }
+  #log p.coach-note { margin:-4px 0 12px 10px; padding:6px 10px; border-left:3px solid #f0b849; border-radius:0 6px 6px 0;
+                      background:#2a2c22; font-size:12.5px; color:#e6dfbe; }
+  .rewrite-box { margin:6px 0; padding:6px 10px; border-left:3px solid #59b388; border-radius:0 6px 6px 0;
+                 background:#1f2b26; font-size:13px; color:#d9efe3; }
+  #fbDrill { background:#1e2f42; border-color:var(--accent); color:var(--accent); }
+  #start.end { background:#5a2a2a; border-color:#a44; }
+  #bankCats { display:flex; flex-wrap:wrap; gap:4px 12px; } #bankCats label { flex-direction:row; align-items:center; gap:4px; font-size:13px; color:var(--text); }
+  #promptPreview { white-space:pre-wrap; font-size:12px; background:var(--bg); padding:8px; border-radius:6px; max-height:260px; overflow:auto; }
+  .engine-row { align-items:center; color:var(--muted); font-size:13px; }
+  select { font:inherit; color:var(--text); background:var(--panel); border:1px solid #3a3e45; border-radius:8px; padding:5px 8px; }
+  #mic { flex:1; display:flex; align-items:center; justify-content:center; gap:8px; }
+  #mic .dot { width:10px; height:10px; border-radius:50%; background:#666; }
+  #mic.on .dot { background:var(--live); } #mic.on.hearing .dot { background:var(--rec); box-shadow:0 0 0 4px #e664; }
+  @media (max-width: 760px) { body { flex-direction:column; height:auto; min-height:100vh; }
+                              #tile { aspect-ratio:1; flex:none; } #log { min-height:200px; } }
+  /* pre-flight modal: shown by Start interview / Watch AI demo when a selected local service isn't usable */
+  #preflight { max-width:520px; width:calc(100% - 32px); border:1px solid #444; border-radius:12px; padding:18px 20px;
+               background:var(--panel); color:var(--text); }
+  #preflight::backdrop { background:rgba(0,0,0,.55); }
+  #preflight h2 { margin:0 0 10px; font-size:17px; color:var(--rec); }
+  #preflight ul { margin:0 0 14px; padding-left:18px; display:flex; flex-direction:column; gap:10px; }
+  #preflight li b { color:var(--text); }
+  #preflight code { background:#1b1d21; padding:1px 5px; border-radius:4px; font-size:12px; }
+  #preflight .hint { color:var(--muted); font-size:13px; }
+  #preflight .row { display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+  "https://cdn.jsdelivr.net/npm/onnxruntime-common/+esm": "https://cdn.jsdelivr.net/npm/onnxruntime-common@1.31.0-dev.20260911-2a43ec07e/+esm"
+} }
+</script>
+</head>
+<body>
+<div id="left">
+  <div id="tile"><canvas id="grain" width="160" height="120"></canvas><div id="speaking"></div>
+    <div id="name">Claire · Interviewer</div><div id="avatarLoading" hidden>Loading avatar…</div><div id="clock" hidden></div>
+    <div id="loadPanel" hidden><div id="loadTitle">Loading…</div><div id="loadBar"><i></i></div><div id="loadText"></div><div id="loadTime"></div></div></div>
+  <div id="status">Loading…</div>
+</div>
+<div id="right">
+  <div id="tabs" role="tablist">
+    <button class="tab" data-tab="setup" role="tab"><span class="step">1</span>Setup</button>
+    <button class="tab on" data-tab="chat" role="tab"><span class="step">2</span>Interview</button>
+    <button class="tab" data-tab="feedback" role="tab"><span class="step">3</span>Feedback</button>
+  </div>
+  <form id="setup" hidden autocomplete="off">
+    <p class="hint">Give the interviewer real context — the more specific, the deeper the questions. Saved in this browser only.
+      <span style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap; margin-top:4px;">
+        <select id="scenarioPick" title="Choose a realistic mock interview scenario"></select>
+        <button type="button" id="loadSample" title="Load the selected preset JD, resume, and rubric">Load scenario</button>
+      </span></p>
+
+    <fieldset class="setup-card engine-pick">
+      <legend>Runtime &amp; AI Models</legend>
+      <div class="grid-2">
+        <label title="Where the AI runs. The other settings below depend on it.">Where the AI runs<select name="engine">
+          <option value="auto">Auto: local server if running, else in-browser</option>
+          <option value="server">Local server (./run.sh): bigger models, best quality</option>
+          <option value="browser">In-browser (WebGPU, experimental): a taster, nothing to install</option></select></label>
+        <label class="browser-only" title="Runs on your GPU through WebGPU. Bigger is better but needs more GPU memory, and on some AMD/Linux drivers the 3B model resets the GPU.">Model (in-browser)<select name="browserLlm">
+          <option value="">Qwen2.5 1.5B (default, ~1 GB)</option>
+          <option value="Qwen2.5-3B-Instruct-q4f16_1-MLC">Qwen2.5 3B (better, ~2 GB, strong GPU)</option></select></label>
+        <label class="server-only">Interview model (local server)<select name="model"><option value="">Fast — nemotron-lightning</option><option value="qwen3.8:27b">Deeper — qwen3.8 27B (slower)</option></select></label>
+        <label class="server-only" title="The report isn't time-critical, so a slower, more careful model is worth it">Feedback model (local server)<select name="feedbackModel"><option value="qwen3.8:27b">Deeper — qwen3.8 27B</option><option value="">Same as interview</option></select></label>
+      </div>
+      <span id="engineNote" class="muted" style="font-size:12px;"></span>
+      <p class="hint browser-only">In-browser mode keeps prompts small: the job description and resume are cut to 2,500 characters each,
+        at most 2 question-bank questions are planned, and lip sync uses phonemes (neural lip sync needs the local server, so Hybrid and Neural fall back to phonemes).</p>
+    </fieldset>
+
+    <fieldset class="setup-card">
+      <legend>Avatar &amp; Voice</legend>
+      <div class="grid">
+        <label title="Which 3D head to show (switches live)" style="grid-column: span 2;">Avatar<select name="avatar"></select></label>
+        <label class="server-only" title="TTS engine on the local server. Kokoro: fastest. ZONOS3-Mini: more natural, 44.1 kHz, ~3x real time on the CPU (needs its server built once, see README)">Voice provider<select name="ttsProvider">
+          <option value="kokoro">Kokoro 82M (Fast, CPU)</option>
+          <option value="zonos">Zyphra ZONOS3-Mini (natural, CPU)</option>
+          <option value="piper">Piper TTS (Lightweight CPU)</option></select></label>
+        <label title="Interviewer voice preset (Kokoro / in-browser)">Voice<select name="voice">
+          <option value="">Avatar default</option>
+          <option value="am_michael">Michael (US, male)</option><option value="am_adam">Adam (US, male)</option>
+          <option value="am_eric">Eric (US, male)</option><option value="bm_george">George (UK, male)</option>
+          <option value="af_heart">Heart (US, female)</option><option value="af_bella">Bella (US, female)</option>
+          <option value="bf_emma">Emma (UK, female)</option></select></label>
+        <label title="Neural = wav2arkit on the server predicts all mouth/jaw blendshapes from the speech audio">Lip sync<select name="lipsync">
+          <option value="hybrid">Hybrid: neural + phoneme seals</option><option value="neural">Neural only</option>
+          <option value="visemes">Phoneme visemes</option></select></label>
+      </div>
+    </fieldset>
+
+    <fieldset class="setup-card">
+      <legend>Role &amp; Interview Format</legend>
+      <div class="grid">
+        <label>Your name<input name="candidate" placeholder="Sam"></label>
+        <label>Interviewer name<input name="interviewer"></label>
+        <label>Role<input name="role" placeholder="Backend Engineer"></label>
+        <label>Seniority<select name="seniority"><option>Junior</option><option>Mid-level</option><option>Senior</option><option>Staff</option><option>Principal</option><option>Manager</option></select></label>
+        <label>Company<input name="company" placeholder="optional"></label>
+        <label>Length (min)<input name="minutes" type="number" min="5" max="90" step="1"></label>
+        <label>Interview type<select name="type"><option value="mixed">Mixed</option><option value="behavioral">Behavioral (STAR)</option><option value="technical">Technical deep-dive</option><option value="system-design">System design</option></select></label>
+        <label>Difficulty<select name="difficulty"><option value="friendly">Friendly</option><option value="standard">Standard bar</option><option value="tough">Tough panel</option></select></label>
+        <label>Interviewer style<select name="style"><option value="warm">Warm</option><option value="neutral">Neutral</option><option value="direct">Direct</option></select></label>
+        <label title="How long a silence ends your turn">Patience<select name="patience"><option value="quick">Quick (0.7 s)</option><option value="normal">Normal (1.2 s)</option><option value="patient">Patient (2.0 s)</option></select></label>
+        <label title="Seconds of silence before the interviewer prompts you (0 = never)">Silence nudge (s)<input name="nudge" type="number" min="0" max="120" step="1"></label>
+        <label title="Use your past interviews here (stored in this browser): probe weak areas again, track progress, steer the AI demo">Adapt to history<select name="adapt"><option value="on">On</option><option value="off">Off</option></select></label>
+        <label title="How the Watch AI Demo candidate frames answers">AI demo style<select name="demoMode"><option value="model">Model answer (STAR + badges)</option><option value="contrast">Contrast mode (weak trap + 4/4)</option></select></label>
+      </div>
+      <label>Focus areas<input name="focus" placeholder="e.g. distributed systems, leadership, Kubernetes"></label>
+    </fieldset>
+
+    <fieldset class="setup-card">
+      <legend>Candidate Context &amp; Rubric</legend>
+      <label>Job description <span class="file">— paste, or <input type="file" data-target="jd" accept=".pdf,.txt,.md"></span><textarea name="jd" rows="4"></textarea></label>
+      <label>Your resume <span class="file">— paste, or <input type="file" data-target="resume" accept=".pdf,.txt,.md"></span><textarea name="resume" rows="4"></textarea></label>
+      <label>ATS Buddy report <span class="muted">(optional — paste the gap analysis; the interviewer will probe weak areas)</span><textarea name="ats" rows="2"></textarea></label>
+      <label>Rubric preset <span class="muted">(BARS framework applied to scoring &amp; coached rewrites)</span><select name="rubricPreset"></select></label>
+      <label>Scoring rubric <span class="muted">(used for the feedback report when you end the interview)</span><textarea name="rubric" rows="4"></textarea></label>
+      <label>Anything else<textarea name="notes" rows="2" placeholder="e.g. ask about my move from frontend to backend"></textarea></label>
+    </fieldset>
+
+    <fieldset id="bank" class="setup-card"><legend>Question Bank <span class="muted" style="text-transform:none; font-weight:normal;">(fresh random pick each interview)</span></legend>
+      <div id="bankCats"></div>
+      <div class="grid-2">
+        <label>Questions per interview<input name="bankCount" type="number" min="0" max="8" step="1"></label>
+      </div>
+      <label>Your own must-ask questions <span class="muted">(one per line)</span><textarea name="customQuestions" rows="2" placeholder="e.g. Describe a time you had to make a difficult decision with limited information."></textarea></label>
+    </fieldset>
+
+    <div class="row"><button type="submit" id="applySetup">Save &amp; start interview</button><button type="button" id="previewPrompt">Preview prompt</button></div>
+    <pre id="promptPreview" hidden></pre>
+  </form>
+  <div id="feedback" hidden>
+    <div id="fbBody"><p class="hint">End an interview to get a scored report against your rubric.</p></div>
+    <div class="row" style="flex-wrap:wrap;"><button type="button" id="fbDrill" hidden title="Run a focused 5-minute follow-up drill on your lowest-scoring areas and practice questions">🎯 Practise Weak Areas (5-min Drill)</button><button type="button" id="fbDownload" hidden>Download report (.md)</button><button type="button" id="fbRegen" hidden>Regenerate</button></div>
+    <details id="history"><summary>Past interviews <span class="muted" id="histCount"></span></summary>
+      <p class="hint">Stored only in this browser. With <b>Adapt to my past interviews</b> on (Setup), the next interviewer can revisit
+        areas supported by verified evidence, and the report can show rough progress for a matching role, level, interview type and rubric.
+        The AI demo provides generated examples; check every detail against your own experience before using it.</p>
+      <div id="histList"></div>
+      <div class="row"><button type="button" id="histExport">Export all (.json)</button><button type="button" id="histClear">Clear history</button></div>
+    </details>
+  </div>
+  <div id="chat">
+  <div id="logWrap"><div id="log"></div><button id="toLatest" hidden>↓ Latest</button></div>
+  <input id="input" placeholder="Type an answer and press Enter" autocomplete="off">
+  <div class="row">
+    <button id="mic" title="Open mic: just talk, interrupt any time"><span class="dot"></span><span id="micLabel">Mic off</span></button>
+    <button id="start">Start interview</button>
+    <button id="demo" title="Watch an illustrative AI candidate answer using your setup; generated details may be wrong">▶ Watch AI demo</button>
+  </div>
+  <p class="hint">AI demo answers are generated examples, not facts to copy or an assessment of your own interview. Replace any missing details with your real experience.</p>
+  <div class="row engine-row"><span id="engineInfo"></span></div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
+// Draco-compressed GLBs (the MetaHuman export); decoder fetched only when such a model loads
+const dracoLoader = new DRACOLoader().setDecoderPath("https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/draco/gltf/");
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
+import { AvatarRig, LiveRig } from "./avatar.js";
+// read before anything saves the setup: a first visit starts at step 1 (Setup), later visits at step 2
+const firstVisit = (() => { try { return !localStorage.getItem("ai-avatar.setup.v1"); } catch { return false; } })();
+import { GpuPhotoRig } from "./photo-avatar-gpu.js";
+import { QUESTION_CATEGORIES, DEFAULT_CATEGORIES, pickQuestions, SCENARIO_PRESETS } from "./question-bank.js";
+import { roleUnspecified, buildCandidatePrompt, buildClosingPrompt, RUBRIC_PRESETS, parseDemoAnswer, demoAnswerIssues, clipDemoRaw } from "./persona.js";
+import { CHECKIN, buildSystemPrompt, buildFeedbackPrompt, feedbackTranscript, verifyReport, nudgeMessage, sttVocabulary, loadSetup, saveSetup } from "./persona.js";
+import { loadHistory, saveSession, deleteSession, clearHistory, avgScore, progress, learnerBrief, briefText } from "./history.js";
+
+const params = new URLSearchParams(location.search);
+// Selectable heads (Setup -> Avatar, or ?avatar=key; ?model=<url> loads any compatible GLB).
+const AVATARS = {
+  // 1. real portrait animated on the local GPU (tools/photoreal: live LivePortrait + MuseTalk lip sync)
+  photoreal: { label: "1. Photoreal (local GPU: ./run.sh --photoreal)", type: "photo", voice: "af_heart", interviewer: "Claire" },
+  // 2. MPFB head (ARKit-52 + Oculus visemes, Mixamo-style rig) driven by the research-based behaviour model +
+  //    speech prosody (CPU only, no GPU needed)
+  "mpfb-live-male": { label: "2. Interviewer (Male): MPFB + live behaviour (CPU)", url: "assets/models/mpfb-interviewer-male.glb", voice: "am_michael", interviewer: "Alex", rig: "live", skinDetail: true, maleOverrides: true },
+  // 3. Unreal MetaHuman (InterviewerV2) via github.com/creategamecharacters/metahuman-to-glb: 51 ARKit shapes, no
+  //    viseme_* shapes (the rig maps visemes onto ARKit), Draco-compressed, MetaHuman skeleton
+  //    (fixed up by tools/fix_metahuman_glb.py)
+  metahuman: { label: "3. Interviewer: Unreal MetaHuman + live behaviour (CPU)", url: "assets/models/metahuman-interviewer-v2.glb", voice: "af_heart", interviewer: "Claire", rig: "live",
+               // hair/brows calibrated to UE's groom: melanin 0.6 roots -> ombre auburn tips (0.35 melanin/redness), soft light brows
+               metahuman: { hair: "#2c1b16", hairTip: "#62301a", brows: "#8a6048", textures: "assets/models/metahuman-v2/" } },
+};
+const DEFAULT_AVATAR = "metahuman";   // also the fallback for saved choices that no longer exist
+const DEFAULT_INTERVIEWER_NAMES = new Set(["Alex", "Claire"]);
+const avatarMeta = (key) => AVATARS[key] || AVATARS[DEFAULT_AVATAR];
+const effectiveInterviewer = (s = setup) => (s.interviewer || "").trim() || avatarMeta(s.avatar).interviewer;
+const WS_URL = params.get("ws") || `ws://${location.hostname || "127.0.0.1"}:8765`;
+const PHOTO_URL = params.get("photoreal") || `ws://${location.hostname || "127.0.0.1"}:8766`;
+const $ = (id) => document.getElementById(id);
+const setStatus = (s) => ($("status").textContent = s);
+const YOUR_TURN = "Your turn — just talk (or type)";
+
+// ---------------------------------------------------------------- 3D scene
+const tile = $("tile");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.03;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+tile.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(26, 1, 0.05, 20);
+// soft image-based light from a neutral room + 3-point portrait studio lighting (softer key, gentle fill & subtle rim)
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.44;
+const key = new THREE.DirectionalLight(0xfff2e6, 1.16);
+key.position.set(-0.78, 1.05, 1.45);
+key.castShadow = true;
+key.shadow.mapSize.set(1024, 1024);
+key.shadow.camera.left = -0.55; key.shadow.camera.right = 0.55;
+key.shadow.camera.top = 0.55; key.shadow.camera.bottom = -0.55;
+key.shadow.camera.near = 0.4; key.shadow.camera.far = 3.5;
+key.shadow.bias = -0.0005; key.shadow.normalBias = 0.008; key.shadow.radius = 4.2;
+scene.add(key); scene.add(key.target);
+const fill = new THREE.DirectionalLight(0xdce6f5, 0.42); fill.position.set(1.15, 0.30, 1.05); scene.add(fill);
+const rim = new THREE.DirectionalLight(0xe8f0ff, 0.68); rim.position.set(0.65, 1.15, -1.25); scene.add(rim);
+const ring = new THREE.PointLight(0xfff6ee, 0.16, 0, 0); camera.add(ring); scene.add(camera);
+const roomEnv = scene.environment;
+let look = "modern", modernBg = null;      // modernBg: applies the chosen room/studio background
+
+// ---- background ---------------------------------------------------------------------
+// ?bg=studio: clean seamless-paper studio gradient. Default: office.
+// ?bg=office (default): real CC0 Poly Haven interior (assets/env/*.hdr) shown out of focus
+// (shallow depth of field) AND used as image-based lighting, so face and room light match.
+const BACKGROUNDS = {
+  office:    { file: "poly_haven_studio_2k.hdr",      yaw: 180, blur: 0.14, bright: 0.45, light: 0.46 },
+};
+const BG = params.get("bg") || "office";
+function studioBackdrop() {
+  const c = document.createElement("canvas"); c.width = 512; c.height = 512;
+  const g = c.getContext("2d");
+  const r = g.createRadialGradient(256, 200, 20, 256, 260, 380);   // soft light falloff on seamless paper
+  r.addColorStop(0, "#b9bcc0"); r.addColorStop(0.55, "#8d9196"); r.addColorStop(1, "#55595e");
+  g.fillStyle = r; g.fillRect(0, 0, 512, 512);
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const backdrop = new THREE.Mesh(new THREE.PlaneGeometry(4.2, 2.6),
+  new THREE.MeshBasicMaterial({ map: studioBackdrop(), toneMapped: false }));
+if (BACKGROUNDS[BG]) {
+  const cfg = BACKGROUNDS[BG], yaw = THREE.MathUtils.degToRad(+(params.get("bgyaw") ?? cfg.yaw));
+  new RGBELoader().load(`assets/env/${cfg.file}`, (hdr) => {
+    hdr.mapping = THREE.EquirectangularReflectionMapping;
+    modernBg = () => {
+    scene.background = hdr;
+    scene.backgroundBlurriness = +(params.get("blur") ?? cfg.blur);
+    scene.backgroundIntensity = cfg.bright;
+    scene.backgroundRotation.set(0, yaw, 0);
+    scene.environment = hdr;
+    scene.environmentIntensity = cfg.light;
+    scene.environmentRotation.set(0, yaw, 0);
+    };
+    if (look === "modern") modernBg();          // don't override the flat 2D look if it's active
+  });
+} else {
+  scene.add(backdrop);
+  modernBg = () => { backdrop.visible = true; scene.background = null; scene.environment = roomEnv; scene.environmentIntensity = 0.4; };
+}
+// "flat" look = the original 2D avatar's plain light-grey tile; "modern" = room/studio background + IBL
+function setLook(next) {
+  look = next;
+  if (next === "flat") {
+    scene.background = new THREE.Color(0xc7d1db); scene.environment = null; backdrop.visible = false;
+  } else if (modernBg) modernBg();
+  else { scene.background = null; scene.environment = roomEnv; scene.environmentIntensity = 0.4; }
+}
+
+function resize() {
+  const w = tile.clientWidth, h = tile.clientHeight;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(tile);
+
+// Material polish (runtime, so any MPFB-style GLB benefits):
+//  - skin: sheen fakes soft subsurface scattering under the key light
+//  - hair/brows/lashes: alpha-blended with the texture's soft alpha -> feathered, not jagged, edges
+//  - eyes: glossy cornea so the environment + ring light give a catchlight
+// Skin micro-detail (generated once, tileable): pores + fine relief as a normal map, and the same relief as a
+// roughness map, so highlights break up like real skin instead of sliding over smooth plastic. MPFB skins only
+// ship a colour texture.
+let skinDetail = null;
+function skinDetailMaps() {
+  if (skinDetail) return skinDetail;
+  const N = 256, h = new Float32Array(N * N), rnd = (() => { let s = 7; return () => ((s = (s * 16807) % 2147483647) / 2147483647); })();
+  const at = (x, y) => ((y + N) % N) * N + ((x + N) % N);
+  for (let o = 0; o < 3; o++) {                       // tileable value noise, 3 octaves (fine relief)
+    const g = 8 << o, grid = Array.from({ length: g * g }, rnd), amp = 0.5 / (1 << o);
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+      const fx = x * g / N, fy = y * g / N, x0 = Math.floor(fx), y0 = Math.floor(fy), tx = fx - x0, ty = fy - y0;
+      const v = (i, j) => grid[((j % g) * g) + (i % g)], sx = tx * tx * (3 - 2 * tx), sy = ty * ty * (3 - 2 * ty);
+      h[y * N + x] += amp * ((v(x0, y0) * (1 - sx) + v(x0 + 1, y0) * sx) * (1 - sy) + (v(x0, y0 + 1) * (1 - sx) + v(x0 + 1, y0 + 1) * sx) * sy);
+    }
+  }
+  for (let k = 0; k < 900; k++) {                     // pores: small soft dips
+    const cx = rnd() * N, cy = rnd() * N, r = 1.2 + rnd() * 1.8, d = 0.35 + rnd() * 0.35;
+    for (let y = Math.floor(cy - 3 * r); y <= cy + 3 * r; y++) for (let x = Math.floor(cx - 3 * r); x <= cx + 3 * r; x++)
+      h[at(x, y)] -= d * Math.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (r * r));
+  }
+  const nc = document.createElement("canvas"), rc = document.createElement("canvas"); nc.width = nc.height = rc.width = rc.height = N;
+  const ni = nc.getContext("2d").createImageData(N, N), ri = rc.getContext("2d").createImageData(N, N);
+  let lo = Infinity, hi = -Infinity; for (const v of h) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const dx = (h[at(x + 1, y)] - h[at(x - 1, y)]) * 2.5, dy = (h[at(x, y + 1)] - h[at(x, y - 1)]) * 2.5, l = Math.hypot(dx, dy, 1), i = 4 * (y * N + x);
+    ni.data[i] = 128 + 127 * (-dx / l); ni.data[i + 1] = 128 + 127 * (dy / l); ni.data[i + 2] = 255 / l; ni.data[i + 3] = 255;
+    const r = 150 + 90 * (1 - (h[y * N + x] - lo) / (hi - lo));   // pores and dips slightly rougher
+    ri.data[i] = ri.data[i + 1] = ri.data[i + 2] = r; ri.data[i + 3] = 255;
+  }
+  nc.getContext("2d").putImageData(ni, 0, 0); rc.getContext("2d").putImageData(ri, 0, 0);
+  const tex = (c) => { const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(64, 64); t.anisotropy = 4; return t; };
+  return (skinDetail = { normal: tex(nc), rough: tex(rc) });
+}
+
+// Procedural tileable woven twill normal + roughness maps for suit jacket, tie, and shirt collar.
+let clothDetail = null;
+function clothDetailMaps() {
+  if (clothDetail) return clothDetail;
+  const N = 128, nc = document.createElement("canvas"), rc = document.createElement("canvas");
+  nc.width = nc.height = rc.width = rc.height = N;
+  const ni = nc.getContext("2d").createImageData(N, N), ri = rc.getContext("2d").createImageData(N, N);
+  const h = new Float32Array(N * N), at = (x, y) => ((y + N) % N) * N + ((x + N) % N);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const warp = Math.sin((x + y * 0.5) * (Math.PI * 2 / 4)), weft = Math.sin((y - x * 0.5) * (Math.PI * 2 / 4));
+    h[y * N + x] = 0.55 * warp + 0.45 * weft;
+  }
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const dx = (h[at(x + 1, y)] - h[at(x - 1, y)]) * 1.4, dy = (h[at(x, y + 1)] - h[at(x, y - 1)]) * 1.4;
+    const l = Math.hypot(dx, dy, 1), i = 4 * (y * N + x);
+    ni.data[i] = 128 + 127 * (-dx / l); ni.data[i + 1] = 128 + 127 * (dy / l); ni.data[i + 2] = 255 / l; ni.data[i + 3] = 255;
+    const r = Math.round(205 + 32 * (0.5 - 0.5 * h[y * N + x]));
+    ri.data[i] = ri.data[i + 1] = ri.data[i + 2] = r; ri.data[i + 3] = 255;
+  }
+  nc.getContext("2d").putImageData(ni, 0, 0); rc.getContext("2d").putImageData(ri, 0, 0);
+  const mk = (c) => { const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(84, 84); t.anisotropy = 4; return t; };
+  return (clothDetail = { normal: mk(nc), rough: mk(rc) });
+}
+
+// Synthesize strand normal + roughness maps from a hair texture's luminance so hair cards catch highlights along strands.
+function buildHairDetailMaps(img, flipY = false) {
+  if (!img || !img.width) return null;
+  const W = Math.min(512, img.width), H = Math.min(512, img.height);
+  const src = document.createElement("canvas"); src.width = W; src.height = H;
+  src.getContext("2d").drawImage(img, 0, 0, W, H);
+  const px = src.getContext("2d").getImageData(0, 0, W, H).data;
+  const nc = document.createElement("canvas"), rc = document.createElement("canvas");
+  nc.width = rc.width = W; nc.height = rc.height = H;
+  const ni = nc.getContext("2d").createImageData(W, H), ri = rc.getContext("2d").createImageData(W, H);
+  const lum = (x, y) => {
+    const cx = Math.max(0, Math.min(W - 1, x)), cy = Math.max(0, Math.min(H - 1, y)), p = 4 * (cy * W + cx);
+    return (0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2]) / 255;
+  };
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const dx = (lum(x + 1, y) - lum(x - 1, y)) * 4.5, dy = (lum(x, y + 1) - lum(x, y - 1)) * 4.5;
+    const l = Math.hypot(dx, dy, 1), i = 4 * (y * W + x), c = lum(x, y);
+    ni.data[i] = 128 + 127 * (-dx / l); ni.data[i + 1] = 128 + 127 * (dy / l); ni.data[i + 2] = 255 / l; ni.data[i + 3] = 255;
+    const r = Math.round(255 * Math.max(0.36, Math.min(0.84, 0.78 - 0.52 * c)));
+    ri.data[i] = ri.data[i + 1] = ri.data[i + 2] = r; ri.data[i + 3] = 255;
+  }
+  nc.getContext("2d").putImageData(ni, 0, 0); rc.getContext("2d").putImageData(ri, 0, 0);
+  const mk = (c) => { const t = new THREE.CanvasTexture(c); t.flipY = flipY; t.anisotropy = 4; return t; };
+  return { normal: mk(nc), rough: mk(rc) };
+}
+
+// Authored UV-space facial roughness map for MakeHuman/MPFB skins (flipY = false):
+// keeps skin in a natural matte-satin range (0.50..0.76) so nose and lips never get plastic white glare,
+// while making the scalp under the hair cards rougher (0.76) than the T-zone (0.52) and lips (0.48).
+function buildSkinZoneRoughness(flipY = false) {
+  const N = 256, c = document.createElement("canvas"); c.width = c.height = N;
+  const ctx = c.getContext("2d"), img = ctx.createImageData(N, N);
+  const ell = (u, v, u0, v0, rx, ry) => Math.max(0, 1 - Math.hypot((u - u0) / rx, (v - v0) / ry));
+  const sm = (x) => x * x * (3 - 2 * x);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const u = (x + 0.5) / N, v = (y + 0.5) / N;
+    let r = 0.60;
+    if (u > 0.63 && u < 0.85) {
+      const scalpCard = sm(ell(u, v, 0.74, 0.508, 0.13, 0.32));
+      const faceCore = sm(ell(u, v, 0.855, 0.508, 0.095, 0.145));
+      r += 0.16 * scalpCard * (1 - faceCore);
+    }
+    r -= 0.06 * sm(ell(u, v, 0.775, 0.508, 0.048, 0.088)); // forehead T-zone (~0.54)
+    r -= 0.08 * sm(ell(u, v, 0.858, 0.508, 0.036, 0.025)); // nose bridge & tip (~0.52)
+    r -= 0.12 * sm(ell(u, v, 0.910, 0.508, 0.019, 0.038)); // lips (~0.48)
+    const val = Math.round(255 * Math.max(0.46, Math.min(0.82, r)));
+    const i = (y * N + x) * 4;
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = val; img.data[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(c);
+  tex.flipY = flipY;
+  return tex;
+}
+
+// Procedural dynamic expression wrinkle normal map + UV zone masks for MakeHuman/MPFB skins (flipY = false):
+// Zone R = horizontal forehead creases (driven by browInnerUp / browOuterUp),
+// Zone G = vertical glabellar "11" frown lines between brows (driven by browDownLeft/Right),
+// Zone B = nasolabial folds & crow's feet (driven by mouthSmile + cheekSquint + eyeSquint).
+let exprMaps = null;
+function buildExpressionMaps(flipY = false) {
+  if (exprMaps) return exprMaps;
+  const N = 256, makeC = () => { const c = document.createElement("canvas"); c.width = c.height = N; return c; };
+  const mc = makeC(), nc = makeC();
+  const mImg = mc.getContext("2d").createImageData(N, N), nImg = nc.getContext("2d").createImageData(N, N);
+  const h = new Float32Array(N * N);
+  const ell = (u, v, u0, v0, rx, ry) => Math.max(0, 1 - Math.hypot((u - u0) / rx, (v - v0) / ry));
+  const sm = (x) => x * x * (3 - 2 * x);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const u = (x + 0.5) / N, v = (y + 0.5) / N, i = y * N + x;
+    // Zone R: forehead horizontal creases (u ~ 0.745..0.805, v ~ 0.43..0.585)
+    const zFore = sm(ell(u, v, 0.775, 0.508, 0.032, 0.082));
+    const wFore = Math.sin((u - 0.75) * 420) * (0.7 + 0.3 * Math.cos((v - 0.508) * 35));
+    // Zone G: glabellar vertical frown lines between brows (u ~ 0.805..0.832, v ~ 0.485..0.531)
+    const zGlab = sm(ell(u, v, 0.818, 0.508, 0.018, 0.025));
+    const dv = v - 0.508;
+    const wGlab = -Math.exp(-((Math.abs(dv) - 0.0075) ** 2) / 0.000012);
+    // Zone B: nasolabial folds (u ~ 0.865..0.920, v ~ 0.45..0.565) + outer-eye crow's feet (u ~ 0.825..0.855)
+    const zNasoL = sm(ell(u, v, 0.892, 0.472, 0.028, 0.022));
+    const zNasoR = sm(ell(u, v, 0.892, 0.544, 0.028, 0.022));
+    const zCrowL = sm(ell(u, v, 0.838, 0.432, 0.018, 0.022));
+    const zCrowR = sm(ell(u, v, 0.838, 0.584, 0.018, 0.022));
+    const zSmile = Math.min(1, zNasoL + zNasoR + 0.75 * (zCrowL + zCrowR));
+    const foldL = -Math.exp(-(((u - 0.875) - (0.482 - v) * 1.15) ** 2) / 0.000025);
+    const foldR = -Math.exp(-(((u - 0.875) - (v - 0.534) * 1.15) ** 2) / 0.000025);
+    const crowWave = Math.sin((u - 0.838) * 520) * 0.65;
+    const wSmile = (zNasoL * foldL + zNasoR * foldR) + 0.5 * (zCrowL + zCrowR) * crowWave;
+
+    h[i] = 0.55 * zFore * wFore + 0.85 * zGlab * wGlab + 0.75 * wSmile;
+    const p = i * 4;
+    mImg.data[p] = Math.round(255 * zFore);
+    mImg.data[p + 1] = Math.round(255 * zGlab);
+    mImg.data[p + 2] = Math.round(255 * zSmile);
+    mImg.data[p + 3] = 255;
+  }
+  const at = (x, y) => h[Math.max(0, Math.min(N - 1, y)) * N + Math.max(0, Math.min(N - 1, x))];
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const dx = (at(x + 1, y) - at(x - 1, y)) * 2.2, dy = (at(x, y + 1) - at(x, y - 1)) * 2.2, l = Math.hypot(dx, dy, 1), p = 4 * (y * N + x);
+    nImg.data[p] = Math.round(128 + 127 * (-dx / l));
+    nImg.data[p + 1] = Math.round(128 + 127 * (dy / l));
+    nImg.data[p + 2] = Math.round(255 / l);
+    nImg.data[p + 3] = 255;
+  }
+  mc.getContext("2d").putImageData(mImg, 0, 0);
+  nc.getContext("2d").putImageData(nImg, 0, 0);
+  const mk = (c) => { const t = new THREE.CanvasTexture(c); t.flipY = flipY; return t; };
+  return (exprMaps = { mask: mk(mc), normal: mk(nc) });
+}
+
+// Unreal MetaHuman GLB: approximate what UE's renderer adds. Skin: UE's subsurface scattering lightens and
+// softens the (fairly dark, saturated) baked albedo; three has no SSS, so lift the albedo and add a warm
+// wrap-diffuse. Hair: UE colours strands from melanin; our cards only carry a grey baked texture, so tint
+// them with the groom colour (luminance of the card texture keeps strand variation).
+// Calibrated against a UE "Studio" viewport capture of the same character. ?mhskin=0 / ?mhhair=0 disable.
+function tuneMetaHuman(root, { hair = "#3a2416", hairTip = hair, brows: browHex = "#2e1a0e", lashes: lashHex = "#1a120f", textures = "" } = {}) {
+  const hairCol = new THREE.Color(hair), tipCol = new THREE.Color(hairTip), brows = new THREE.Color(browHex), lashCol = new THREE.Color(lashHex);
+  // data atlases next to the GLB (linear, not colour): hair/brow card attributes, hair tangents, lash coverage
+  const ld = (f) => { if (!textures) return null; const t = new THREE.TextureLoader().load(textures + f); t.flipY = false; t.wrapS = t.wrapT = THREE.RepeatWrapping; return t; };
+  // hair is now a CC0 MakeHuman mesh (tools/makehuman_hair.py) with its own texture; the groom card atlases are
+  // only needed if the GLB still carries UE hair cards
+  const tex = { hair: null, hairTangent: null, brows: ld("brows-attribute.png"), lashes: ld("lashes-coverage.png") };
+  const hairInner = [];
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    const m = o.material, name = m?.name ?? "";
+    if (/Face_Skin|Body_Baked/.test(name) && params.get("mhskin") !== "0") {
+      m.roughness = Math.min(m.roughness, 0.85);
+      m.sheen = 0.12; m.sheenRoughness = 0.6; m.sheenColor = new THREE.Color(0.9, 0.75, 0.7);
+      // COLOR_1 = the converter's scalp mask (1 = bare skin, ~0 = under hair); COLOR_0 isn't albedo
+      const scalp = !!o.geometry.attributes.color_1;
+      m.vertexColors = false;
+      m.onBeforeCompile = (s) => {
+        s.uniforms.uHair = { value: hairCol };
+        if (scalp) s.vertexShader = "attribute vec4 color_1;\nvarying float vScalp;\n" +
+          s.vertexShader.replace("#include <begin_vertex>", "#include <begin_vertex>\n// only the cranium: the mask also covers cheeks/neck under hanging hair\nvScalp = mix(1.0, color_1.r, smoothstep(1.74, 1.79, position.y));");
+        s.fragmentShader = (scalp ? "varying float vScalp;\n" : "") + "uniform vec3 uHair;\n" + s.fragmentShader
+          .replace("#include <map_fragment>", `#include <map_fragment>
+            diffuseColor.rgb *= vec3(1.30, 1.42, 1.46);                        // energy UE's SSS adds back
+            diffuseColor.rgb = min(diffuseColor.rgb, vec3(1.0));
+            ${scalp ? "diffuseColor.rgb = mix(uHair * 0.8, diffuseColor.rgb, smoothstep(0.15, 0.85, vScalp));   // scalp under the hair cards" : ""}`)
+          .replace("#include <lights_fragment_end>", `#include <lights_fragment_end>
+            {                                                                  // soft red scatter into the shadow side
+              float l = dot(reflectedLight.directDiffuse, vec3(0.299, 0.587, 0.114));
+              reflectedLight.indirectDiffuse += diffuseColor.rgb * vec3(0.16, 0.07, 0.05) * (1.0 - smoothstep(0.0, 0.5, l));
+            }`);
+      };
+      m.needsUpdate = true;
+    }
+    // MPFB brow strip (tools/mpfb_brows.py): polishMaterials' 0.02 cutoff lets the texture's pale fringe show
+    if (/Eyebrows_MPFB/.test(name)) { m.alphaTest = 0.15; m.transparent = true; m.depthWrite = false; m.opacity = 0.85; m.color.setRGB(2.3, 1.85, 1.5); o.renderOrder = 2; m.needsUpdate = true; }   // soft edge, lifted tint
+    if (/Eyebrows_.*Card/.test(name) && params.get("mhhair") !== "0")
+    {
+      // brow strands cover ~2% of their atlas: mipmaps + blending average each card into a smudgy patch.
+            // Mip-aware gain instead: coverage is boosted by how minified the atlas is, capped below opaque.
+      if (tex.brows) tex.brows.anisotropy = 8;
+      mhHairCards(m, { col: brows, attr: tex.brows, density: 0.45, mipAware: 0.42 });   // UE brows read soft, near skin tone
+      o.renderOrder = 1;
+    }
+    // CC0 MakeHuman hair fitted to the head (tools/makehuman_hair.py): its own texture, alpha-tested so it sorts
+    // cleanly against the face, a little sheen; glTF exports it as BLEND
+    if (/^MH_Hair_/.test(name) && params.get("mhhair") !== "0") {
+      m.transparent = false; m.depthWrite = true; m.alphaTest = 0.45; m.side = THREE.DoubleSide;
+      m.roughness = 0.62; m.metalness = 0; m.envMapIntensity = 0.3;
+      if ("specularIntensity" in m) { m.specularIntensity = 0.25; m.sheen = 0.25; m.sheenRoughness = 0.4; m.sheenColor = hairCol.clone().multiplyScalar(2.5); }
+      // recolour: keep the texture's light/shade (strand detail) but map it to the configured root -> tip colours
+      m.customProgramCacheKey = () => m.uuid;
+      m.onBeforeCompile = (s) => {
+        s.uniforms.uHair = { value: hairCol }; s.uniforms.uTip = { value: tipCol };
+        s.fragmentShader = "uniform vec3 uHair;\nuniform vec3 uTip;\n" + s.fragmentShader.replace("#include <map_fragment>", `#include <map_fragment>
+          {
+            float lum = clamp(dot(diffuseColor.rgb, vec3(0.299, 0.587, 0.114)) * 1.6, 0.0, 1.0);
+            diffuseColor.rgb = mix(uHair, uTip, lum) * (0.55 + 0.9 * lum);
+          }`);
+      };
+      o.castShadow = true; m.needsUpdate = true;
+    }
+    if (/Hair_.*Card/.test(name) && params.get("mhhair") !== "0" && tex.hair) {
+      // two passes (the viewer's non-A2C path): an opaque alpha-clipped core for density, then a soft blended
+      // fringe. Alpha-to-coverage let the background through partially covered strands, reading as grey hair.
+      const hc = { col: hairCol, tip: tipCol, attr: tex.hair, tangent: tex.hairTangent, density: 1.6 };
+      const inner = o.clone(); inner.material = m.clone(); inner.name = o.name + "__inner";
+      mhHairCards(inner.material, { ...hc, clip: 0.7 });
+      mhHairCards(m, hc);
+      hairInner.push([o, inner]);
+    }
+    // eyelashes: the GLB carries a lash material with alpha 0 (invisible); UE draws them from a coverage texture
+    if (/Eyelashes|LashMat/.test(name) && tex.lashes) {
+      m.map = null; m.alphaMap = tex.lashes; m.opacity = 1;
+      m.color.copy(lashCol); m.roughness = 0.6; m.metalness = 0;
+      m.transparent = true; m.alphaTest = 0; m.depthWrite = false; m.side = THREE.DoubleSide;
+      m.polygonOffset = true; m.polygonOffsetFactor = -4; m.polygonOffsetUnits = -16;   // roots sit inside the lids
+      tex.lashes.anisotropy = 8;                                       // thin strands survive oblique/minified views
+      m.onBeforeCompile = (s) => {                                     // coverage is in R (grey PNG); a little denser
+        s.fragmentShader = s.fragmentShader.replace("#include <alphamap_fragment>",
+          "#ifdef USE_ALPHAMAP\n diffuseColor.a *= clamp(texture2D(alphaMap, vAlphaMapUv).r * 1.1, 0.0, 1.0);\n#endif");
+      };
+      o.renderOrder = 2;
+      m.needsUpdate = true;
+    }
+  });
+  for (const [o, inner] of hairInner) { o.parent.add(inner); o.renderOrder = 1; }   // add after traversing
+}
+
+// Hair/eyebrow cards, ported from github.com/creategamecharacters/metahuman-to-glb's viewer (applyHair;
+// MIT, (c) 2026 smorchj - see THIRD_PARTY_NOTICES.md):
+// the card atlas is data, not albedo - R = coverage, G = root->tip, B = per-strand seed; the tangent atlas
+// aligns an anisotropic highlight along the strands. Colour comes from the groom. Head hair uses
+// an opaque alpha-clipped core plus a blended fringe; brows alpha-blend.
+function mhHairCards(m, { col, tip = col, attr, tangent, density, clip = 0, mipAware = 0 }) {
+  if (!attr) return;
+  m.map = null; m.color.copy(col);
+  m.alphaMap = attr; m.alphaHash = false; m.side = THREE.DoubleSide;
+  m.roughness = 0.6; m.metalness = 0; m.specularIntensity = 0.1; m.envMapIntensity = 0;   // cool rim/env spec read as grey streaks
+  m.specularColor = tip.clone().multiplyScalar(2.5);                  // hair spec is tinted by the fibre colour
+  m.sheen = 0;
+  m.alphaToCoverage = false;
+  if (clip) { m.transparent = false; m.depthWrite = true; m.alphaTest = clip; }      // opaque core
+  else { m.transparent = true; m.depthWrite = false; m.alphaTest = 0; }              // soft blended edges
+  m.polygonOffset = true; m.polygonOffsetFactor = -4; m.polygonOffsetUnits = -16;   // cards sit <1 mm off the scalp
+  if (tangent) { m.anisotropyMap = tangent; m.anisotropy = 0.2; m.anisotropyRotation = -1.09; }
+  m.customProgramCacheKey = () => m.uuid;
+  m.onBeforeCompile = (s) => {
+    s.uniforms.uDensity = { value: density };
+    s.uniforms.uTip = { value: tip };
+    s.fragmentShader = "uniform float uDensity;\nuniform vec3 uTip;\n" + s.fragmentShader
+      .replace("#include <map_fragment>", `#include <map_fragment>
+        #ifdef USE_ALPHAMAP
+        {
+          vec4 at = texture2D(alphaMap, vAlphaMapUv);
+          float strand = 1.0 + (at.b - 0.5) * 0.72;                              // per-strand brightness
+          diffuseColor.rgb = mix(diffuseColor.rgb, uTip, smoothstep(0.15, 0.9, at.g));   // ombre: root colour -> tip colour (G: root->tip)
+          diffuseColor.rgb = mix(diffuseColor.rgb, uTip * 1.8, step(0.88, at.b) * 0.45 * at.g); // sparse lighter highlight strands
+          float fib = fract(sin(floor(vAlphaMapUv.x * 1400.0) * 12.9898) * 43758.5453);
+          strand *= 0.86 + 0.28 * fib;                                           // fine fibre-to-fibre variation
+          float ndv = abs(dot(normalize(vNormal), normalize(vViewPosition)));
+          float ao = mix(0.3, 1.0, smoothstep(0.05, 0.55, ndv));                 // edge-on cards sit deeper
+          diffuseColor.rgb *= strand * ao;
+        }
+        #endif`)
+      .replace("#include <roughnessmap_fragment>", `float roughnessFactor = roughness;
+        #ifdef USE_ALPHAMAP
+        {
+          vec4 at2 = texture2D(alphaMap, vAlphaMapUv);
+          roughnessFactor = clamp(max(roughnessFactor + (at2.b - 0.5) * 0.16 + (1.0 - at2.g) * 0.06, 0.72), 0.0, 1.0);
+        }
+        #endif`)
+      .replace("#include <alphamap_fragment>", mipAware
+        ? `#ifdef USE_ALPHAMAP
+            float texels = max(1.0, length(fwidth(vAlphaMapUv)) * ${attr.image?.width || 2048}.0);   // atlas texels per pixel
+            diffuseColor.a *= clamp(texture2D(alphaMap, vAlphaMapUv).r * uDensity * sqrt(texels), 0.0, ${mipAware.toFixed(2)});
+          #endif`
+        : "#ifdef USE_ALPHAMAP\n diffuseColor.a *= clamp(texture2D(alphaMap, vAlphaMapUv).r * uDensity, 0.0, 1.0);\n#endif");
+  };
+  m.needsUpdate = true;
+}
+
+function polishMaterials(root, { detail = false } = {}) {
+  const uniforms = {
+    uMouthOpen: { value: 0 },
+    uEyeClosure: { value: 0 },
+    uExprWrinkles: { value: new THREE.Vector3(0, 0, 0) }, // x = browUp, y = browDown, z = smile/squint
+  };
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    const m = o.material, name = m?.name ?? "";
+    if (/body/i.test(name)) {
+      o.castShadow = true;
+      o.receiveShadow = true;
+      const p = new THREE.MeshPhysicalMaterial();
+      THREE.MeshStandardMaterial.prototype.copy.call(p, m);
+      Object.assign(p, { roughness: 0.6, metalness: 0, sheen: 0.09, sheenRoughness: 0.65,
+                         sheenColor: new THREE.Color(0.88, 0.72, 0.66) });
+      if (detail) {
+        const d = skinDetailMaps(), ex = buildExpressionMaps(m.map?.flipY ?? false);
+        // Subtle pore relief + authored zone roughness + dynamic FACS expression wrinkles
+        // + pre-integrated subsurface scattering (warm blood-vessel wrap at shadow terminators)
+        // + localized tear-meniscus & lip moisture glints (cheeks/forehead stay matte-satin).
+        Object.assign(p, {
+          roughness: 1.0,
+          roughnessMap: buildSkinZoneRoughness(m.map?.flipY ?? false),
+          normalMap: d.normal,
+          normalScale: new THREE.Vector2(0.15, 0.15),
+        });
+        p.onBeforeCompile = (shader) => {
+          shader.uniforms.uExprWrinkles = uniforms.uExprWrinkles;
+          shader.uniforms.uEyeClosure = uniforms.uEyeClosure;
+          shader.uniforms.tExprMask = { value: ex.mask };
+          shader.uniforms.tExprNormal = { value: ex.normal };
+          shader.fragmentShader = `uniform vec3 uExprWrinkles;\nuniform float uEyeClosure;\nuniform sampler2D tExprMask;\nuniform sampler2D tExprNormal;\n` +
+            shader.fragmentShader.replace(
+              "#include <map_fragment>",
+              `#include <map_fragment>
+              #ifdef USE_MAP
+              {
+                // Natural facial color variation: lips, cheeks, nose bridge, forehead warmth & restrained mottled skin tone
+                float dLipM = length((vMapUv - vec2(0.912, 0.508)) / vec2(0.015, 0.036));
+                float lipMask = exp(-dLipM * dLipM * 2.2);
+                diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(1.10, 0.78, 0.80), lipMask * 0.52);
+                float dCheekL = length((vMapUv - vec2(0.868, 0.432)) / vec2(0.030, 0.034));
+                float dCheekR = length((vMapUv - vec2(0.868, 0.584)) / vec2(0.030, 0.034));
+                float cheekFlush = max(exp(-dCheekL * dCheekL * 1.7), exp(-dCheekR * dCheekR * 1.7));
+                float dNose = length((vMapUv - vec2(0.862, 0.508)) / vec2(0.030, 0.018));
+                float noseWarm = exp(-dNose * dNose * 2.0);
+                float dForehead = length((vMapUv - vec2(0.775, 0.508)) / vec2(0.038, 0.072));
+                float foreheadWarm = exp(-dForehead * dForehead * 1.6);
+                diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(1.045, 0.935, 0.93), clamp(cheekFlush * 0.40 + noseWarm * 0.24, 0.0, 0.55));
+                diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(1.02, 0.985, 0.95), foreheadWarm * 0.22);
+                float mottle = sin(vMapUv.x * 110.0 + sin(vMapUv.y * 85.0) * 1.7) * cos(vMapUv.y * 95.0);
+                diffuseColor.rgb *= (1.0 + 0.018 * mottle);
+                float isForehead = smoothstep(0.41, 0.46, vMapUv.y) * (1.0 - smoothstep(0.55, 0.60, vMapUv.y));
+                float hairlineAO = 1.0 - 0.14 * (1.0 - smoothstep(0.725, 0.775, vMapUv.x)) * isForehead;
+                diffuseColor.rgb *= hairlineAO;
+              }
+              #endif`
+            ).replace(
+              "#include <normal_fragment_maps>",
+              `#include <normal_fragment_maps>
+              #ifdef USE_NORMALMAP_TANGENTSPACE
+              {
+                vec2 bodyUv = vNormalMapUv / 64.0;
+                vec3 zMask = texture2D(tExprMask, bodyUv).rgb;
+                float exprWeight = clamp(dot(zMask, uExprWrinkles), 0.0, 1.0);
+                if (exprWeight > 0.005) {
+                  vec3 exN = texture2D(tExprNormal, bodyUv).xyz * 2.0 - 1.0;
+                  exN.xy *= exprWeight * 0.38;
+                  normal = normalize(tbn * exN + normal);
+                }
+              }
+              #endif`
+            ).replace(
+              "#include <lights_fragment_end>",
+              `#include <lights_fragment_end>
+              #ifdef USE_NORMALMAP_TANGENTSPACE
+              {
+                vec2 bodyUv2 = vNormalMapUv / 64.0;
+                vec3 zMask2 = texture2D(tExprMask, bodyUv2).rgb;
+                vec3 exN2 = texture2D(tExprNormal, bodyUv2).xyz * 2.0 - 1.0;
+                float furrow = clamp(dot(zMask2, uExprWrinkles) * length(exN2.xy), 0.0, 1.0);
+                float creaseAO = 1.0 - 0.14 * furrow;
+                reflectedLight.directDiffuse *= creaseAO;
+                reflectedLight.indirectDiffuse *= creaseAO;
+
+                // Subsurface Scattering (SSS) terminator bleed: calm hemoglobin scatter where direct light rolls into shadow
+                float directLum = dot(reflectedLight.directDiffuse, vec3(0.299, 0.587, 0.114));
+                float sssBand = smoothstep(0.01, 0.22, directLum) * (1.0 - smoothstep(0.22, 0.68, directLum));
+                // Face region mask in MPFB UV space (u ~ 0.72..0.95, v ~ 0.35..0.66)
+                float isFace = smoothstep(0.70, 0.75, bodyUv2.x) * (1.0 - smoothstep(0.94, 0.98, bodyUv2.x))
+                             * smoothstep(0.32, 0.38, bodyUv2.y) * (1.0 - smoothstep(0.63, 0.69, bodyUv2.y));
+                reflectedLight.directDiffuse += diffuseColor.rgb * vec3(0.24, 0.07, 0.05) * sssBand * (0.45 + 0.55 * isFace);
+
+                // Subtle wet tear-meniscus & lower-lip moisture glint in MPFB UV space
+                float dTearL = length((bodyUv2 - vec2(0.836, 0.463)) / vec2(0.010, 0.022));
+                float dTearR = length((bodyUv2 - vec2(0.836, 0.553)) / vec2(0.010, 0.022));
+                float tearLine = max(exp(-dTearL * dTearL * 3.5), exp(-dTearR * dTearR * 3.5)) * (1.0 - 0.7 * uEyeClosure);
+                float dLip = length((bodyUv2 - vec2(0.912, 0.508)) / vec2(0.014, 0.032));
+                float lipWet = exp(-dLip * dLip * 2.5);
+                vec3 viewDir = normalize(vViewPosition);
+                vec3 halfVec = normalize(viewDir + vec3(0.0, 0.35, 0.65));
+                float rimWet = pow(max(0.0, dot(normal, halfVec)), 48.0);
+                float lipGlint = pow(max(0.0, dot(normal, halfVec)), 28.0);
+                reflectedLight.directSpecular += vec3(0.24, 0.23, 0.22) * tearLine * rimWet
+                                               + vec3(0.11, 0.09, 0.09) * lipWet * lipGlint;
+              }
+              #endif`
+            );
+        };
+      }
+      o.material = p;
+    } else if (detail && /teeth_base|tongue/i.test(name)) {
+      o.receiveShadow = true;
+      // MakeSkin oral realism: enamel clearcoat on front incisors, warm sub-surface gum/tongue scatter,
+      // and deep oral-cavity ambient occlusion that opens dynamically with jaw/lip movement.
+      const isTeeth = /teeth_base/i.test(name);
+      const p = new THREE.MeshPhysicalMaterial();
+      THREE.MeshStandardMaterial.prototype.copy.call(p, m);
+      Object.assign(p, {
+        roughness: isTeeth ? 0.32 : 0.48,
+        metalness: 0,
+        envMapIntensity: isTeeth ? 0.42 : 0.25,
+        clearcoat: isTeeth ? 0.55 : 0.25,
+        clearcoatRoughness: isTeeth ? 0.18 : 0.35,
+        sheen: isTeeth ? 0.15 : 0.35,
+        sheenRoughness: 0.5,
+        sheenColor: isTeeth ? new THREE.Color(1.0, 0.96, 0.88) : new THREE.Color(0.95, 0.35, 0.35),
+      });
+      p.onBeforeCompile = (shader) => {
+        shader.uniforms.uMouthOpen = uniforms.uMouthOpen;
+        shader.fragmentShader = "uniform float uMouthOpen;\n" + shader.fragmentShader.replace(
+          "#include <lights_fragment_end>",
+          `#include <lights_fragment_end>
+          {
+            vec3 nDir = normalize(vNormal);
+            float front = smoothstep(-0.15, 0.85, nDir.z);
+            float openLight = clamp(0.24 + 0.76 * smoothstep(0.02, 0.40, uMouthOpen), 0.24, 1.0);
+            float cavityAO = openLight * (0.36 + 0.64 * front);
+            // Warm translucent scattering at tooth tips & tongue edges when light enters the mouth
+            float edgeScatter = smoothstep(0.1, 0.7, front) * (1.0 - abs(nDir.y) * 0.5) * openLight;
+            reflectedLight.directDiffuse = reflectedLight.directDiffuse * cavityAO + diffuseColor.rgb * vec3(0.12, 0.06, 0.04) * edgeScatter;
+            reflectedLight.indirectDiffuse *= cavityAO;
+            reflectedLight.directSpecular *= cavityAO * front * 0.85;
+            reflectedLight.indirectSpecular *= cavityAO * front * 0.85;
+          }`
+        );
+      };
+      o.material = p;
+    } else if (m.alphaTest > 0) {
+      // Hair, eyebrows & eyelashes: convert to MeshPhysicalMaterial with soft sheen so strands catch
+      // directional key/rim light naturally instead of looking like flat matte paper planes.
+      const isLash = /eyelash/i.test(name), isBrow = /eyebrow/i.test(name), isHair = !isLash && !isBrow;
+      o.receiveShadow = isHair;
+      const p = new THREE.MeshPhysicalMaterial();
+      THREE.MeshStandardMaterial.prototype.copy.call(p, m);
+      Object.assign(p, {
+        transparent: true,
+        alphaTest: 0.02,
+        depthWrite: true,
+        roughness: isHair ? 0.62 : 0.78,
+        metalness: 0,
+        sheen: detail && isHair ? 0.30 : 0.18,
+        sheenRoughness: 0.28,
+        sheenColor: new THREE.Color(0.68, 0.50, 0.38),
+        clearcoat: detail && isHair ? 0.08 : 0.0,
+        clearcoatRoughness: 0.36,
+      });
+      if (detail && isHair && m.map?.image) {
+        const hd = buildHairDetailMaps(m.map.image, m.map.flipY);
+        if (hd) {
+          p.roughnessMap = hd.rough;
+          p.roughness = 1.0;
+          if (!m.normalMap) { p.normalMap = hd.normal; p.normalScale = new THREE.Vector2(0.55, 0.55); }
+          else p.normalScale = new THREE.Vector2(0.80, 0.80);
+        }
+        // Subtle silk-hair anisotropic sheen band & multi-tonal strand breakup so hair cards don't read as one flat mass
+        p.onBeforeCompile = (shader) => {
+          shader.fragmentShader = shader.fragmentShader.replace(
+            "#include <map_fragment>",
+            `#include <map_fragment>
+            #ifdef USE_MAP
+            {
+              float strandVar = sin(vMapUv.x * 240.0 + sin(vMapUv.y * 18.0) * 1.4) * 0.5 + 0.5;
+              diffuseColor.rgb *= mix(0.88, 1.12, strandVar);
+            }
+            #endif`
+          ).replace(
+            "#include <lights_fragment_end>",
+            `#include <lights_fragment_end>
+            {
+              vec3 hView = normalize(vViewPosition);
+              vec3 hHalf = normalize(hView + normalize(vec3(-0.35, 0.65, 0.65)));
+              float aniso = pow(max(0.0, 1.0 - abs(dot(normal, hHalf) - 0.12) * 3.0), 6.0);
+              float lumH = dot(diffuseColor.rgb, vec3(0.299, 0.587, 0.114));
+              reflectedLight.directSpecular += vec3(0.22, 0.16, 0.12) * aniso * smoothstep(0.03, 0.25, lumH);
+            }`
+          );
+        };
+      } else if (detail && isHair && m.normalMap) {
+        p.normalScale = new THREE.Vector2(0.80, 0.80);
+      }
+      if (detail && isLash) { p.opacity = 0.85; p.color.multiplyScalar(0.55); }
+      if (detail && isBrow) { p.opacity = 0.90; p.color.multiplyScalar(0.85); }
+      o.renderOrder = isLash ? 3 : isBrow ? 2 : 1;
+      o.material = p;
+    } else if (/high-poly.*eyes|low-poly.*eyes/i.test(name)) {
+      o.receiveShadow = true;
+      // MPFB2 Realistic Eye Upgrade:
+      // 1. MeshPhysicalMaterial with IOR 1.376 (human cornea) + clearcoat over the corneal bulge.
+      // 2. High-detail 512px procedural UV mask encoding:
+      //    - R: roughness (mirror-smooth 0.04 over cornea/iris, satin 0.34 over sclera)
+      //    - G: limbal ring darkening (anatomical dark ring where iris meets sclera + deep pupil core)
+      //    - B: iris concavity mask (drives opposite-side caustic illumination & iris fiber depth)
+      const p = new THREE.MeshPhysicalMaterial();
+      THREE.MeshStandardMaterial.prototype.copy.call(p, m);
+      Object.assign(p, { roughness: 0.28, metalness: 0, envMapIntensity: 0.75, ior: 1.376 });
+      if (detail && m.map) {
+        const N = 512, rCanvas = document.createElement("canvas"), aCanvas = document.createElement("canvas");
+        rCanvas.width = rCanvas.height = aCanvas.width = aCanvas.height = N;
+        const rCtx = rCanvas.getContext("2d"), rPx = rCtx.createImageData(N, N);
+        const aCtx = aCanvas.getContext("2d"), aPx = aCtx.createImageData(N, N);
+        const sm = (x) => { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); };
+        for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+          const u = (x + 0.5) / N, v = (y + 0.5) / N;
+          const dx1 = u - 0.707, dy1 = v - 0.296, d1 = Math.hypot(dx1, dy1);
+          const dx2 = u - 0.292, dy2 = v - 0.704, d2 = Math.hypot(dx2, dy2);
+          const isEye1 = d1 < d2;
+          const d = isEye1 ? d1 : d2;
+          const dx = isEye1 ? dx1 : dx2, dy = isEye1 ? dy1 : dy2;
+          const angle = Math.atan2(dy, dx);
+
+          // Cornea transition (radius ~ 0.095 in UV space)
+          const scleraMix = sm((d - 0.088) / 0.032);
+          const rough = Math.round(255 * (0.04 + 0.30 * scleraMix));
+          const i = (y * N + x) * 4;
+          rPx.data[i] = rPx.data[i + 1] = rPx.data[i + 2] = rough;
+          rPx.data[i + 3] = 255;
+
+          // Anatomical details in aCanvas:
+          // R = Limbal ring + deep black pupil depth darkening (0 = dark, 1 = normal)
+          // G = Iris radial stroma fiber modulation + caustic bowl mask
+          // B = Sclera warm vascularity / inner-corner caruncle warmth
+          const pupil = 1.0 - 0.92 * (1.0 - sm((d - 0.023) / 0.011));
+          const limbal = 1.0 - 0.56 * Math.exp(-(((d - 0.086) / 0.012) ** 2));
+          const irisMask = (1.0 - scleraMix) * sm((d - 0.026) / 0.012);
+          const fibers = 0.5 + 0.5 * (0.6 * Math.sin(angle * 44.0 + d * 120.0) + 0.4 * Math.cos(angle * 73.0 - d * 80.0));
+          const scleraVein = scleraMix * sm((d - 0.11) / 0.14);
+
+          aPx.data[i] = Math.round(255 * Math.max(0, Math.min(1, pupil * limbal)));
+          aPx.data[i + 1] = Math.round(255 * Math.max(0, Math.min(1, irisMask * (0.65 + 0.35 * fibers))));
+          aPx.data[i + 2] = Math.round(255 * Math.max(0, Math.min(1, scleraVein)));
+          aPx.data[i + 3] = 255;
+        }
+        rCtx.putImageData(rPx, 0, 0);
+        aCtx.putImageData(aPx, 0, 0);
+        p.roughnessMap = new THREE.CanvasTexture(rCanvas);
+        p.roughnessMap.flipY = m.map.flipY;
+        const eyeAnatomyTex = new THREE.CanvasTexture(aCanvas);
+        eyeAnatomyTex.flipY = m.map.flipY;
+        Object.assign(p, {
+          roughness: 1.0,
+          clearcoat: 0.9,
+          clearcoatRoughness: 1.0,
+          clearcoatRoughnessMap: p.roughnessMap,
+          sheen: 0.14,
+          sheenRoughness: 0.65,
+          sheenColor: new THREE.Color(0.95, 0.45, 0.40), // subtle warm microvascular scatter on sclera
+        });
+        p.onBeforeCompile = (shader) => {
+          shader.uniforms.uEyeClosure = uniforms.uEyeClosure;
+          shader.uniforms.tEyeAnatomy = { value: eyeAnatomyTex };
+          shader.fragmentShader = "uniform float uEyeClosure;\nuniform sampler2D tEyeAnatomy;\n" +
+            shader.fragmentShader.replace(
+              "#include <map_fragment>",
+              `#include <map_fragment>
+              #ifdef USE_MAP
+              {
+                vec3 anat = texture2D(tEyeAnatomy, vMapUv).rgb;
+                // Neutralize muddy sclera cast before keeping subtle outer vascular warmth
+                float cleanSclera = smoothstep(0.05, 0.28, anat.b);
+                diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.95, 0.93, 0.92), cleanSclera * 0.18);
+                // Deep black pupil + sharp limbal ring (anat.r) and radial stroma fiber contrast (anat.g)
+                diffuseColor.rgb *= (0.12 + 0.88 * anat.r);
+                diffuseColor.rgb *= (1.0 + 0.20 * (anat.g - 0.35) * step(0.05, anat.g));
+                // Subtle warm tint towards outer sclera / lacrimal margin (anat.b)
+                diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(1.02, 0.96, 0.95), anat.b * 0.16);
+              }
+              #endif`
+            ).replace(
+              "#include <lights_fragment_end>",
+              `#include <lights_fragment_end>
+              {
+                vec3 nDir = normalize(vNormal);
+                float eyeY = nDir.y;
+                float lidLine = 0.29 - uEyeClosure * 0.62;
+                // Upper-lid ambient occlusion shadow + subtle lower-lid contact shading & sclera caruncle warmth
+                float upperShadow = 1.0 - 0.28 * smoothstep(lidLine - 0.14, lidLine + 0.24, eyeY);
+                float lowerShadow = 1.0 - 0.09 * smoothstep(-0.24, -0.50, eyeY);
+                float lidAO = upperShadow * lowerShadow;
+                reflectedLight.directDiffuse *= lidAO;
+                reflectedLight.indirectDiffuse *= lidAO;
+                float cornerWarm = smoothstep(0.45, 0.88, abs(nDir.x)) * (1.0 - smoothstep(0.15, 0.45, abs(eyeY)));
+                reflectedLight.directDiffuse = mix(reflectedLight.directDiffuse, reflectedLight.directDiffuse * vec3(1.06, 0.88, 0.87), cornerWarm * 0.45);
+                // Dampen top-of-eyeball specular & clearcoat glare under the upper lid and lashes
+                float specMask = 1.0 - 0.58 * smoothstep(lidLine - 0.05, lidLine + 0.18, eyeY);
+                reflectedLight.directSpecular *= specMask;
+                reflectedLight.indirectSpecular *= specMask;
+                #ifdef USE_CLEARCOAT
+                clearcoatSpecularDirect *= specMask;
+                clearcoatSpecularIndirect *= specMask;
+                #endif
+                #ifdef USE_MAP
+                vec3 anat2 = texture2D(tEyeAnatomy, vMapUv).rgb;
+                // Crisp studio softbox catchlight in corneal reflection + lower tear-meniscus wetness glint
+                vec3 eyeViewDir = normalize(vViewPosition);
+                vec3 eyeRefl = reflect(-eyeViewDir, nDir);
+                vec2 boxD = abs(eyeRefl.xy - vec2(-0.32, 0.34)) / vec2(0.11, 0.14);
+                float catchBox = (1.0 - smoothstep(0.45, 1.0, max(boxD.x, boxD.y))) * step(0.35, eyeRefl.z);
+                float corneaZone = 1.0 - smoothstep(0.05, 0.30, anat2.b);
+                float tTear = (eyeY + 0.25) / 0.09;
+                float lowerTearWet = exp(-(tTear * tTear)) * (1.0 - uEyeClosure);
+                reflectedLight.directSpecular += vec3(0.88, 0.86, 0.82) * catchBox * corneaZone * specMask
+                                               + vec3(0.28, 0.27, 0.26) * lowerTearWet * pow(max(0.0, eyeRefl.z), 10.0);
+                // Corneal refraction caustic: concave iris chamber catches warm light on the side opposite the key light
+                float caustic = anat2.g * max(0.0, dot(-nDir, normalize(vec3(-0.6, 0.5, 0.6)))) * lidAO;
+                reflectedLight.directDiffuse += diffuseColor.rgb * vec3(0.55, 0.45, 0.32) * caustic;
+                #endif
+              }`
+            );
+        };
+      }
+      o.material = p;
+    } else if (detail && m && !m.transparent) {
+      // Suit jacket, shirt collar & tie: keep baked normal map if present (e.g. female_elegantsuit01),
+      // else fall back to woven twill micro-normal + soft fabric sheen + real contact shadows
+      const p = new THREE.MeshPhysicalMaterial();
+      THREE.MeshStandardMaterial.prototype.copy.call(p, m);
+      Object.assign(p, {
+        metalness: 0,
+        envMapIntensity: 0.45,
+        sheen: 0.35,
+        sheenRoughness: 0.72,
+        sheenColor: new THREE.Color(0.85, 0.87, 0.92),
+      });
+      if (m.normalMap) {
+        p.roughness = 0.84;
+        p.normalScale = new THREE.Vector2(0.85, 0.85);
+      } else {
+        const cd = clothDetailMaps();
+        p.roughness = 1.0;
+        p.roughnessMap = cd.rough;
+        p.normalMap = cd.normal;
+        p.normalScale = new THREE.Vector2(0.11, 0.11);
+      }
+      o.castShadow = true;
+      o.receiveShadow = true;
+      o.material = p;
+    }
+  });
+  return uniforms;
+}
+
+let rig = null, mood = "listening", camBase = null;
+const setMood = (m) => { mood = m; rig?.setMood(m); };
+
+let avatarRoot = null, avatarLoading = 0;
+function disposeAvatar() {
+  if (!avatarRoot) return;               // free the previous head's GPU memory
+  scene.remove(avatarRoot);
+  avatarRoot.traverse((o) => { o.geometry?.dispose(); [].concat(o.material || []).forEach((m) => { for (const v of Object.values(m)) v?.isTexture && v.dispose(); m.dispose(); }); });
+  avatarRoot = null;
+}
+function loadAvatar(url) {
+  const my = ++avatarLoading;
+  if (rig instanceof GpuPhotoRig) { rig.dispose(); rig = null; renderer.domElement.style.visibility = ""; }
+  if ((AVATARS[shownAvatar] || {}).type === "photo" && !params.get("model")) {
+    // photoreal portrait streamed from the local GPU service
+    disposeAvatar();
+    const note = $("avatarLoading");
+    note.hidden = false; note.textContent = "Connecting to the photoreal service…";
+    const onStatus = (msg) => { note.hidden = !msg; if (msg) note.textContent = msg; };
+    rig = new GpuPhotoRig(tile, PHOTO_URL, onStatus);
+    rig.lipsync = setup.lipsync;
+    rig.setMood(mood === "speaking" ? "listening" : mood);
+    if (params.has("debug")) window.__photo = rig;                 // test hook
+    renderer.domElement.style.visibility = "hidden";
+    return;
+  }
+  $("avatarLoading").hidden = false;     // own indicator: server status messages can't overwrite it
+  const loader = new GLTFLoader();
+  loader.setDRACOLoader(dracoLoader);
+  loader.load(url, (gltf) => {
+    if (my !== avatarLoading) return;                       // a newer selection won
+    disposeAvatar(); setLook("modern");
+    const shaderUniforms = polishMaterials(gltf.scene, { detail: !!(AVATARS[shownAvatar] || {}).skinDetail });
+    if ((AVATARS[shownAvatar] || {}).metahuman) tuneMetaHuman(gltf.scene, AVATARS[shownAvatar].metahuman);
+    const maleOverrides = !!(AVATARS[shownAvatar] || {}).maleOverrides;
+    if (maleOverrides && params.get("hair") !== "base") {
+      new THREE.TextureLoader().load("assets/models/hair-generated-experiment.png", (texture) => {
+        if (my !== avatarLoading) { texture.dispose(); return; }
+        texture.flipY = false;
+        texture.colorSpace = THREE.SRGBColorSpace;
+        gltf.scene.traverse((o) => {
+          if (o.isMesh && /short02/i.test(o.material?.name ?? "")) {
+            // alphaMap reads green, so copy the original texture's alpha into RGB.
+            const original = o.material.map;
+            if (original?.image) {
+              const canvas = document.createElement("canvas");
+              canvas.width = original.image.width; canvas.height = original.image.height;
+              const ctx = canvas.getContext("2d");
+              ctx.drawImage(original.image, 0, 0);
+              const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
+              for (let i = 0; i < pixels.data.length; i += 4) {
+                pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = pixels.data[i + 3];
+                pixels.data[i + 3] = 255;
+              }
+              ctx.putImageData(pixels, 0, 0);
+              const mask = new THREE.CanvasTexture(canvas);
+              mask.flipY = original.flipY;
+              mask.wrapS = original.wrapS; mask.wrapT = original.wrapT;
+              o.material.alphaMap = mask;
+            }
+            const hd = buildHairDetailMaps(texture.image, texture.flipY);
+            if (hd) {
+              o.material.normalMap = hd.normal;
+              o.material.normalScale = new THREE.Vector2(0.65, 0.65);
+              o.material.roughnessMap = hd.rough;
+              o.material.roughness = 1.0;
+            }
+            o.material.map = texture;
+            o.material.needsUpdate = true;
+          }
+        });
+      });
+    }
+    const skinParam = params.get("skin");
+    if (maleOverrides && skinParam !== "base") {
+      new THREE.TextureLoader().load("assets/models/skin-young-clean.jpg", (texture) => {
+        if (my !== avatarLoading) { texture.dispose(); return; }
+        texture.flipY = false;
+        texture.colorSpace = THREE.SRGBColorSpace;
+        gltf.scene.traverse((o) => {
+          if (o.isMesh && /body/i.test(o.material?.name ?? "")) {
+            if (o.material.map) { texture.wrapS = o.material.map.wrapS; texture.wrapT = o.material.map.wrapT; texture.anisotropy = 4; }
+            o.material.map = texture;
+            o.material.needsUpdate = true;
+          }
+        });
+      });
+    }
+    scene.add(avatarRoot = gltf.scene);
+    rig = (AVATARS[shownAvatar] || {}).rig === "live" ? new LiveRig(gltf.scene) : new AvatarRig(gltf.scene);
+    rig.shaderUniforms = shaderUniforms;
+    rig.lipsync = setup.lipsync;
+    rig.setMood(mood === "speaking" ? "listening" : mood);
+    gltf.scene.updateMatrixWorld(true);
+    const head = rig.headWorldPosition();
+    camBase = new THREE.Vector3(head.x, head.y + 0.04, head.z + 1.30);
+    camera.position.copy(camBase); camera.lookAt(head.x, head.y - 0.03, head.z);
+    key.position.set(head.x - 0.85, head.y + 0.95, head.z + 1.35);
+    key.target.position.set(head.x, head.y - 0.05, head.z);
+    key.target.updateMatrixWorld();
+    backdrop.position.set(head.x, head.y - 0.1, head.z - 1.6);
+    if (params.has("debug")) window.__app = { THREE, scene, camera, rig, root: gltf.scene, audio: () => audioCtx, playing: () => !!current };   // test hook
+    $("avatarLoading").hidden = true;
+  }, (xhr) => { if (my === avatarLoading && xhr.total) $("avatarLoading").textContent = `Loading avatar… ${Math.round(100 * xhr.loaded / xhr.total)}%`; },
+  (e) => { $("avatarLoading").hidden = true; setStatus("Could not load avatar " + url + ": " + (e?.message || e)); });
+}
+const avatarUrl = (key) => params.get("model") || avatarMeta(key).url;
+
+// ---------------------------------------------------------------- speech playback
+let audioCtx;
+const queue = [];            // decoded sentences waiting to play
+let current = null;          // {source, start}
+let gen = 0;                 // bumped on interrupt so late-decoding sentences are dropped
+let waitingFor = null;       // sentence held back until the photoreal avatar has frames for it
+const ensureAudio = () => (audioCtx ??= new AudioContext());
+const setPlaying = (on) => { $("speaking").style.opacity = on ? 1 : 0; send({ type: "playback", playing: on }); };
+
+async function say(msg) {
+  const my = gen, ctx = ensureAudio();
+  if (msg.pcm) {                        // browser engine: Float32 PCM
+    msg.buffer = ctx.createBuffer(1, msg.pcm.length, msg.sr); msg.buffer.copyToChannel(msg.pcm, 0);
+  } else {                              // server: base64 WAV
+    const bytes = Uint8Array.from(atob(msg.wav_b64), (c) => c.charCodeAt(0));
+    msg.buffer = await ctx.decodeAudioData(bytes.buffer);
+  }
+  if (my !== gen) return;
+  rig?.prepare?.(msg);                  // photoreal: start generating its frames now
+  queue.push(msg);
+  if (!current && !waitingFor) playNext();
+}
+function playNext() {
+  const msg = queue.shift();
+  if (!msg) {
+    if (current) setPlaying(false);
+    const wasCandidate = current?.role === "candidate", finalSentence = current?.last !== false;
+    if (hangUpAfterAudio && !wasCandidate && (current?.last !== false)) { current = null; rig?.endSpeech(); hangUp(); return; }
+    current = null; rig?.endSpeech(); if (rig) rig.userTalking = false;
+    if (demo.on) { if (!wasCandidate || finalSentence) demo.played(wasCandidate); return; }
+    if (serverState !== "thinking") { setMood("listening"); setStatus(micOn ? YOUR_TURN : "Your turn — turn the mic on, or type"); armNudge(); }
+    return;
+  }
+  if (rig?.ready && msg.role !== "candidate" && waitingFor !== msg) {
+    // photoreal: hold the audio until the first frames are buffered, so lips and voice start together
+    queue.unshift(msg); waitingFor = msg;
+    const g = gen;
+    rig.ready(msg).then(() => { if (g === gen && waitingFor === msg) playNext(); });    // msg is still queue[0]
+    return;
+  }
+  waitingFor = null;
+  const src = audioCtx.createBufferSource();
+  src.buffer = msg.buffer; src.connect(audioCtx.destination);
+  const start = audioCtx.currentTime + 0.02;
+  src.start(start);
+  if (!current) setPlaying(true);
+  current = { source: src, start, role: msg.role, last: msg.last };
+  // playback clock = what the listener hears now (subtract output latency)
+  if (msg.role === "candidate") { if (rig) { rig.endSpeech?.(); rig.userTalking = true; } setMood("listening"); }
+  else rig?.startSpeech(msg, () => audioCtx.currentTime - start - (audioCtx.outputLatency || 0));
+  mood = "speaking";
+  src.onended = () => { if (current?.source === src) playNext(); };
+}
+function interrupt() {
+  gen++; queue.length = 0; waitingFor = null;
+  if (current) { const s = current.source; current = null; s.stop(); setPlaying(false); }
+  rig?.endSpeech();
+}
+
+// ---------------------------------------------------------------- animation loop (+ webcam feel)
+const clock = new THREE.Clock(); let t = 0;
+// Camera artefacts (grain, framing drift, exposure breathing) are opt-in: ?fx=webcam.
+// Off by default - animated noise + a moving frame on top of head motion is tiring to watch.
+const WEBCAM_FX = params.get("fx") === "webcam";
+$("grain").hidden = !WEBCAM_FX;
+const grain = $("grain").getContext("2d"), grainImg = grain.createImageData(160, 120);
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1); t += dt;
+  rig?.update(dt);
+  if (WEBCAM_FX) {
+    if (camBase) camera.position.set(camBase.x + Math.sin(t * 0.21) * 0.006, camBase.y + Math.sin(t * 0.17 + 1) * 0.004, camBase.z);
+    renderer.toneMappingExposure = 1.0 + Math.sin(t * 0.13) * 0.025 + Math.sin(t * 0.41) * 0.01;
+    for (let i = 0; i < grainImg.data.length; i += 4) {
+      const v = Math.random() * 255; grainImg.data[i] = grainImg.data[i + 1] = grainImg.data[i + 2] = v; grainImg.data[i + 3] = 255;
+    }
+    grain.putImageData(grainImg, 0, 0);
+  }
+  if (!(rig instanceof GpuPhotoRig)) renderer.render(scene, camera);
+});
+
+// ---------------------------------------------------------------- engine: local server or in-browser
+// ?engine=auto (default): use the local backend if it answers, otherwise the in-browser WebGPU
+// engine (that's what GitHub Pages visitors get). ?engine=server | browser forces one.
+const enginePref = () => params.get("engine") || setup.engine || "auto";   // setup is ready by the time this runs
+let engine = null, engineKind = null, serverState = "listening", midReply = null, lastReply = null, liveLine = null, lastYouLine = null;
+
+class ServerTransport {
+  constructor(url) { this.url = url; this.onmessage = () => {}; this.connect(); }
+  get open() { return this.ws?.readyState === 1; }
+  connect() {
+    this.ws = new WebSocket(this.url); this.ws.binaryType = "arraybuffer";
+    this.ws.onopen = () => { setStatus("Connected to local server — press Start"); sendConfig(); };
+    this.ws.onclose = () => { setStatus("Local server offline — start backend/server.py (retrying)"); setTimeout(() => this.connect(), 2000); };
+    this.ws.onmessage = (e) => this.onmessage(JSON.parse(e.data));
+  }
+  send(o) { if (this.open) this.ws.send(JSON.stringify(o)); }
+  sendAudio(buf) { if (this.open) this.ws.send(buf); }
+}
+const probeServer = (url, ms = 1500) => new Promise((res) => {
+  let ws; const done = (ok) => { clearTimeout(timer); try { ws?.close(); } catch {} res(ok); };
+  const timer = setTimeout(() => done(false), ms);
+  try { ws = new WebSocket(url); ws.onopen = () => done(true); ws.onerror = () => done(false); } catch { done(false); }
+});
+// ---- pre-flight: before an interview (or AI demo) starts, check the local services the Setup depends on and explain
+// what's missing in a modal, instead of the interview silently falling back (Kokoro voice, an offline face).
+const checks = new Map(); let checkId = 0;
+const serverCheck = (tts) => new Promise((res) => {
+  const id = ++checkId;
+  const t = setTimeout(() => { checks.delete(id); res({ ok: false, error: "no answer from the local server" }); }, 45000);
+  checks.set(id, (m) => { clearTimeout(t); res(m); });
+  send({ type: "check", id, tts });
+});
+async function preflightIssues() {
+  const issues = [];
+  if (setup.avatar === "photoreal" && !params.get("model")) {
+    setStatus("Checking the Photoreal face service…");
+    if (!(await probeServer(PHOTO_URL)))
+      issues.push(`<b>The Photoreal face service isn't running yet.</b> Start the app with <code>./run.sh --photoreal</code>
+        (Windows: <code>run.bat --photoreal</code>). It takes about 1.5 minutes to start; until then the face shows an
+        "offline" note. <span class="hint">Or choose another avatar under Setup → Avatar.</span>`);
+  }
+  if (engineKind === "server" && setup.ttsProvider === "zonos") {
+    setStatus("Checking the ZONOS3-Mini voice… (starts its server if needed)");
+    const r = await serverCheck("zonos");
+    if (!r.ok)
+      issues.push(`<b>The ZONOS3-Mini voice isn't available,</b> so the interviewer would speak with Kokoro instead.
+        <span class="hint">${esc(r.error || "")}</span> Build its server once (README: "Optional: ZONOS3-Mini voice"), or
+        choose Kokoro under Setup → Voice provider.`);
+  }
+  setStatus("");
+  return issues;
+}
+async function preflight() {
+  let issues = await preflightIssues();
+  if (!issues.length) return true;
+  const dlg = $("preflight"), list = $("pfList"), btns = [$("pfCancel"), $("pfRetry"), $("pfGo")];
+  const show = (xs) => { list.innerHTML = xs.map((h) => `<li>${h}</li>`).join(""); };
+  show(issues);
+  // The dialog stays open while "Check again" runs: closing and reopening it let the first close() event (dispatched
+  // asynchronously) reach the reopened dialog's handler and cancel the start - a demo then ran as a plain interview.
+  // Esc uses the "cancel" event, which only a real Esc press fires (not a programmatic close()).
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (settled) return; settled = true; dlg.oncancel = null; if (dlg.open) dlg.close(); resolve(v); };
+    $("pfCancel").onclick = () => done(false);
+    $("pfGo").onclick = () => done(true);
+    $("pfRetry").onclick = async () => {
+      btns.forEach((x) => (x.disabled = true));
+      list.innerHTML = `<li class="hint">Checking again…</li>`;
+      issues = await preflightIssues();
+      btns.forEach((x) => (x.disabled = false));
+      if (!issues.length) done(true); else show(issues);
+    };
+    dlg.oncancel = () => done(false);                         // Esc
+    dlg.showModal();
+    $("pfGo").focus();
+  });
+}
+
+
+// Explain how to get WebGPU working (or use the local server) when in-browser mode can't start.
+function showWebGPUHelp(gpu) {
+  const ua = navigator.userAgent, linux = /Linux/.test(ua) && !/Android/.test(ua), firefox = /Firefox/.test(ua), safari = /Safari/.test(ua) && !/Chrome/.test(ua);
+  const steps = firefox ? "Firefox: WebGPU is on by default only in recent versions on Windows/macOS - try desktop Chrome or Edge instead."
+    : safari ? "Safari: needs Safari 26+ (macOS 26 / iOS 26). Otherwise use Chrome or Edge."
+    : linux ? "Linux Chrome/Edge: WebGPU is off by default. Open chrome://flags, enable \"Unsafe WebGPU Support\" (#enable-unsafe-webgpu) and \"Vulkan\" (#enable-vulkan), then restart the browser."
+    : "Chrome/Edge: update the browser and GPU drivers; check chrome://gpu shows \"WebGPU: Hardware accelerated\".";
+  setStatus(`In-browser mode needs WebGPU, which isn't available here (${gpu.reason}${gpu.error ? ": " + gpu.error : ""}). ${steps} Or run the full app locally: ./run.sh (Windows: run.bat). Check your browser at webgpureport.org.`);
+  addLine('<b style="color:var(--rec)">WebGPU unavailable.</b> ').append(steps + " — or run the local server (./run.sh / run.bat) for the full experience.");
+}
+// Visible loading panel over the avatar: bar, current step, elapsed time (ticks so it never looks frozen)
+const loadPanel = {
+  t0: 0, timer: null, max: 0,
+  show(title, note = "") {
+    this.t0 = performance.now(); this.max = 0; this.note = note; $("loadTitle").textContent = title; $("loadPanel").hidden = false;
+    clearInterval(this.timer);
+    this.timer = setInterval(() => { $("loadTime").textContent = `${Math.round((performance.now() - this.t0) / 1000)} s elapsed${this.note ? " - " + this.note : ""}`; }, 500);
+  },
+  update(f, text) {   // monotonic: WebLLM restarts its own % when it switches from download to cache load
+    this.max = Math.max(this.max, Math.min(1, f));
+    $("loadBar").firstChild.style.width = `${Math.round(Math.max(0.02, this.max) * 100)}%`; if (text) $("loadText").textContent = text; },
+  hide() { clearInterval(this.timer); $("loadPanel").hidden = true; },
+};
+async function chooseEngine() {
+  const ENGINE_PREF = enginePref();
+  applyEngineFields(ENGINE_PREF === "auto" ? null : ENGINE_PREF);
+  if (ENGINE_PREF !== "browser") setStatus("Looking for the local server…");
+  if (ENGINE_PREF !== "browser" && (ENGINE_PREF === "server" || await probeServer(WS_URL))) {
+    engine = new ServerTransport(WS_URL); engineKind = "server";
+  } else {
+    setStatus("No local server - checking WebGPU for in-browser mode…");
+    const { BrowserEngine, BROWSER_DEFAULTS } = await import("./browser-engine.js");
+    engineKind = "browser";
+    const gpu = await BrowserEngine.gpuStatus();
+    if (!gpu.ok) { showWebGPUHelp(gpu); $("start").disabled = true; applyEngineFields("browser"); return; }
+    engine = new BrowserEngine({ llm: params.get("llm") || setup.browserLlm || null, voice: params.get("voice"),
+      onProgress: (f, label) => {
+        if (!$("loadPanel").hidden) { setStatus(`Loading in-browser models… ${Math.round(f * 100)}%`); loadPanel.update(f, label); }
+        else if (f >= 1 && !running) setStatus("In-browser models ready — press Start");   // finished in the background after a cancel
+      } });
+    setStatus(`Experimental in-browser mode, a taster with a small model (${params.get("llm") || setup.browserLlm || BROWSER_DEFAULTS.llm}) — press Start. First run downloads the models, cached afterwards.`);
+  }
+  engine.onmessage = onEngineMessage;
+  sendConfig();
+  applyEngineFields(engineKind);
+}
+// Show the Setup fields that apply to the chosen engine (null = still detecting: show both). Runs before the
+// engine connects, so step 1 never depends on step 2.
+function applyEngineFields(kind) {
+  document.querySelectorAll(".server-only").forEach((el) => (el.hidden = kind === "browser"));
+  document.querySelectorAll(".browser-only").forEach((el) => (el.hidden = kind === "server"));
+  const pref = enginePref();
+  const now = kind === "server" ? "local server" : kind === "browser" ? "in-browser (WebGPU)" : "detecting…";
+  $("engineNote").textContent = (pref === "auto" ? `Auto picked: ${now}` : `Using: ${now}`) + (params.get("engine") ? " (set by the page link)" : "");
+  $("engineInfo").textContent = `AI runs ${kind === "server" ? "on the local server" : kind === "browser" ? "in this browser" : "…"} · change in Setup`;
+}
+
+function onEngineMessage(m) {
+    // after End, ignore whatever the engine was still producing (replies in flight, VAD, captions)
+    if (!running && !["completion", "error"].includes(m.type)) return;
+    if (m.type === "state") {
+      serverState = m.state;
+      if (m.state === "thinking") { setMood("thinking"); setStatus("Thinking…"); }
+      if (m.state === "speaking") setStatus("Speaking… (talk to interrupt)");
+      if (m.state === "listening" && !current) { setMood("listening"); setStatus(YOUR_TURN); }
+    } else if (m.type === "check") {                  // pre-flight answer (see preflight())
+      checks.get(m.id)?.(m); checks.delete(m.id);
+    } else if (m.type === "completion") {
+      completions.get(m.id)?.(m); completions.delete(m.id);
+    } else if (m.type === "end_call") {               // interviewer said goodbye: hang up once the audio is done
+      hangUpAfterAudio = true;
+      if (!current && !queue.length) hangUp();
+    } else if (m.type === "merge") {                  // they weren't finished: their next words continue the last answer
+      const i = transcript.map((t) => t.who).lastIndexOf("Candidate");
+      if (i >= 0) { transcript.splice(i); lastTurn = transcript.at(-1) || null; }
+      if (lastYouLine?.isConnected) {                  // remove their previous line and the reply they talked over
+        let n = lastYouLine; while (n) { const next = n.nextElementSibling; if (n !== liveLine) n.remove(); n = next; }
+      }
+      lastYouLine = null; midReply = lastReply = null;
+    } else if (m.type === "partial") {                // live caption while the candidate speaks
+      if (!liveLine) liveLine = addLine('<b>You:</b> <span class="live"></span>');
+      liveLine.querySelector(".live").textContent = m.text;
+
+    } else if (m.type === "vad") {
+      const hearing = m.state === "speech";
+      if (hearing) candidateActive();
+      if (!hearing && liveLine && !liveLine.querySelector(".live").textContent) { liveLine.remove(); liveLine = null; }
+      $("mic").classList.toggle("hearing", hearing);
+      if (rig) rig.userTalking = hearing;
+      if (hearing) { setStatus("Listening…"); if (current && lastReply) lastReply.insertAdjacentHTML("beforeend", ' <span class="cut">— interrupted</span>'); }
+    } else if (m.type === "stop") {
+      interrupt();
+    } else if (m.type === "say" && m.role === "interviewer") {   // scripted interviewer line (demo goodbye)
+      if (!midReply) { midReply = lastReply = addLine('<b class="ai">Interviewer:</b>'); transcript.push(lastTurn = { who: "Interviewer", text: m.text, open: true }); }
+      else lastTurn.text += " " + m.text;
+      midReply.append(" " + m.text);
+      if (m.last) { midReply = null; lastTurn.open = false; }
+      say(m);
+    } else if (m.type === "say" && m.role === "candidate") {     // AI demo candidate speaking
+      say(m);
+    } else if (m.type === "say") {
+      demo.replyStarted();
+      if (!midReply) { midReply = lastReply = addLine('<b class="ai">Interviewer:</b>'); }
+      midReply.append(" " + m.text);
+      if (lastTurn?.who === "Interviewer" && lastTurn.open) lastTurn.text += " " + m.text;
+      else transcript.push(lastTurn = { who: "Interviewer", text: m.text, open: true });
+      clearNudge();
+      say(m);
+    } else if (m.type === "transcript") {
+      if (m.role === "assistant") { midReply = null; if (lastTurn) lastTurn.open = false; demo.replyDone(); }
+      else if (demo.on && m.text && m.text === demo.sent) { demo.sent = null; }   // engine echoes the AI answer back: already shown
+      else if (liveLine && !m.text) { liveLine.remove(); liveLine = null; }
+      else if (m.text) {
+        if (liveLine) { liveLine.innerHTML = "<b>You:</b> "; liveLine.append(m.text); lastYouLine = liveLine; liveLine = null; }   // caption -> final text
+        else (lastYouLine = addLine("<b>You:</b> ")).append(m.text); transcript.push(lastTurn = { who: "Candidate", text: m.text }); candidateActive(); }
+    } else if (m.type === "error") {
+      addLine('<b style="color:var(--rec)">error:</b> ').append(m.message);
+    }
+}
+function addLine(html) {
+  const p = document.createElement("p"); p.innerHTML = html; $("log").append(p);
+  return p;                                    // scrolling is handled by the observer below
+}
+// Auto-scroll the transcript on ANY change (new lines, replies growing sentence by sentence, live captions,
+// AI demo lines) - unless the user has scrolled up to re-read; then show "Latest" until they come back down.
+const logAutoScroll = (() => {
+  const log = $("log"); let follow = true;
+  const atBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  const toBottom = () => { log.scrollTop = log.scrollHeight; };   // instant: smooth-scroll events would look like the user scrolling up
+  log.addEventListener("scroll", () => { follow = atBottom(); if (follow) $("toLatest").hidden = true; });
+  new MutationObserver(() => {
+    if (follow) requestAnimationFrame(toBottom); else $("toLatest").hidden = false;
+  }).observe(log, { childList: true, subtree: true, characterData: true });
+  $("toLatest").onclick = () => { follow = true; $("toLatest").hidden = true; toBottom(); };
+  return { reset() { follow = true; $("toLatest").hidden = true; } };
+})();
+const send = (o) => engine?.send(o);
+// microtask: runs after this whole module has evaluated - with ?engine=server chooseEngine() has no await
+// before sendConfig(), and calling it inline hit `setup` before initialisation (whole page dead)
+const engineChosen = Promise.resolve().then(chooseEngine);
+
+let startToken = 0, hangUpAfterAudio = false;
+// the interviewer ended the call (his goodbye carried [end]): like a real call, it's over - go to feedback
+async function hangUp() {
+  hangUpAfterAudio = false;
+  if (!running) return;
+  await endInterview();                        // (endInterview stores a demo's transcript, then turns the demo off)
+  if (!/feedback|Feedback/.test($("status").textContent)) setStatus("The interviewer ended the call — press Start for another interview");
+}
+// interview clock: elapsed / planned, amber in the last quarter, red when over
+const interviewClock = {
+  t0: 0, timer: null, used: 0,
+  start() { this.t0 = performance.now(); this.used = 0; $("clock").hidden = false; clearInterval(this.timer); this.timer = setInterval(() => this.tick(), 500); this.tick(); },
+  stop() { if (this.t0) this.used = (performance.now() - this.t0) / 60000; clearInterval(this.timer); this.timer = null; },
+  minutes() { return this.t0 ? (this.timer ? (performance.now() - this.t0) / 60000 : this.used) : 0; },
+  overtime() { return this.timer && this.minutes() >= (+setup.minutes || 10); },
+  tick() {
+    const m = this.minutes(), plan = +setup.minutes || 10, fmt = (x) => `${Math.floor(x)}:${String(Math.floor((x % 1) * 60)).padStart(2, "0")}`;
+    $("clock").textContent = `${fmt(m)} / ${fmt(plan)}`;
+    $("clock").classList.toggle("warn", m >= plan * 0.75 && m < plan); $("clock").classList.toggle("over", m >= plan);
+  },
+};
+$("start").onclick = async () => {
+  if (running) return endInterview();          // End (also cancels a start that is still loading)
+  const my = ++startToken;
+  setRunning(true);                            // button flips to "End interview" immediately
+  ensureAudio().resume(); interrupt(); $("log").replaceChildren(); showTab("chat"); sessionId = null; if (lastReport) lastReport.saved = null;
+  transcript.length = 0; lastTurn = null; nudges = 0;
+  midReply = lastReply = liveLine = lastYouLine = null;   // a reply cut off by End must not swallow the new greeting
+  hangUpAfterAudio = false;
+  logAutoScroll.reset();
+  drawBankQuestions();
+  await engineChosen;
+  if (!engine) { setRunning(false); return; }
+  if (!(await preflight())) {                  // a selected local service isn't usable and the learner cancelled
+    setRunning(false); demo.on = false; $("demo").disabled = false; setStatus("Start cancelled - see Setup");
+    return;
+  }
+  if (my !== startToken || !running) return;  // ended while the check ran
+  if (engineKind === "browser") {
+    if (!engine.ready) {                       // models already in GPU memory from an earlier interview -> no panel
+      const c = await engine.cacheStatus(); engine.cached = c.all;
+      if (!c.available) loadPanel.show("Downloading AI models (no cache on this address)", "the browser can't cache here - open http://localhost:8080 or http://127.0.0.1:8080");
+      else if (c.all) loadPanel.show("Loading AI models from cache - no download", "cached in this browser for this address (localhost and 127.0.0.1 are cached separately)");
+      else loadPanel.show("Downloading AI models - first visit (~1.5 GB)", "cached afterwards: later visits load in ~5 s");
+      loadPanel.update(0, "starting…");
+    }
+    try { await engine.load(); }
+    catch (e) { loadPanel.hide(); setRunning(false); setStatus("Could not load in-browser models: " + (e?.message || e)); return; }
+    loadPanel.hide();
+  }
+  if (my !== startToken || !running) return;   // ended / restarted while loading
+  send({ type: "reset" }); sendConfig(); send({ type: "start" });
+  interviewClock.start();
+  if (!micOn && !demo.on) await setMic(true);
+};
+function setRunning(on) {
+  running = on;
+  $("start").textContent = on ? "End interview" : "Start interview";
+  $("start").classList.toggle("end", on);
+  updateTabs();
+}
+// Wizard steps: 1 Setup -> 2 Interview -> 3 Feedback. While an interview (or AI demo) runs, the other steps are
+// locked so the setup can't change under it and the call isn't left by accident. Feedback opens once there is
+// something to show (a report, or past interviews).
+function updateTabs() {
+  const tab = (n) => document.querySelector(`.tab[data-tab="${n}"]`);
+  const hasFeedback = !!lastReport || loadHistory().length > 0;
+  tab("setup").disabled = running;
+  tab("feedback").disabled = running || !hasFeedback;
+  tab("setup").title = running ? "Locked during the interview - end it to change the setup" : "";
+  tab("feedback").title = running ? "Available after the interview" : hasFeedback ? "" : "End an interview to get feedback";
+  tab("setup").classList.toggle("done", running || hasFeedback);
+  tab("chat").classList.toggle("done", hasFeedback && !running);
+}
+async function endInterview() {
+  startToken++;                                // cancel a start that is still loading models
+  wasDemo = demo.on;
+  if (demo.on && transcript.some((t) => t.who === "Candidate")) {   // keep the demo transcript (no report for demos)
+    saveSession({ when: Date.now(), mode: "demo", setup: snapshotSetup(), minutes: interviewClock.minutes(), transcript: transcript.map((t) => ({ who: t.who, text: t.text })) });
+    renderHistory();
+  }
+  demo.on = false; $("demo").disabled = false;
+  clearNudge(); interrupt(); send({ type: "end" }); setRunning(false); loadPanel.hide(); interviewClock.stop();
+  if (micOn) await setMic(false);
+  $("mic").classList.remove("hearing"); if (liveLine) { liveLine.remove(); liveLine = null; }
+  setMood("listening");
+  if (!transcript.some((t) => t.who === "Candidate")) { setStatus("Interview ended — press Start to begin again"); return; }
+  // (generateFeedback() itself refuses when there are too few real words)
+  setStatus("Interview ended — generating feedback…");
+  await generateFeedback();
+}
+$("input").onkeydown = (e) => {
+  if (e.key !== "Enter" || !e.target.value.trim()) return;
+  ensureAudio().resume(); interrupt();
+  if (!running) setRunning(true);              // typing an answer counts as being in an interview
+  send({ type: "text", text: e.target.value.trim() }); e.target.value = ""; candidateActive();
+};
+
+// ---------------------------------------------------------------- transcript, silence nudges, feedback
+const transcript = []; let lastTurn = null, running = false, nudges = 0, nudgeTimer = null;
+const completions = new Map(); let completionId = 0;
+function clearNudge() { clearTimeout(nudgeTimer); nudgeTimer = null; }
+function candidateActive() { nudges = 0; clearNudge(); }
+function armNudge() {
+  clearNudge();
+  const secs = +setup.nudge || 0;
+  // no nudges in the AI demo: the AI candidate often needs longer than the nudge delay to write its answer, and a
+  // nudge then pre-empts it (the interviewer "prompts" an empty chair and the candidate never gets a turn)
+  if (!running || demo.on || secs <= 0 || nudges >= 2 || interviewClock.overtime()) return;   // time's up: don't keep prompting
+  nudgeTimer = setTimeout(() => {
+    if (!running || demo.on || current || serverState === "thinking" || $("mic").classList.contains("hearing")) return;
+    nudges++;
+    send({ type: "nudge", text: nudgeMessage(secs, nudges) });
+  }, secs * 1000);
+}
+const complete = (prompt, json = true) => new Promise((resolve) => {
+  const id = ++completionId; completions.set(id, resolve);
+  // the feedback report uses the (deeper) feedback model; the demo candidate needs speed -> interview model
+  send({ type: "complete", id, prompt, json, model: json ? (setup.feedbackModel || setup.model || "") : (setup.model || "") });
+});
+function parseJSON(text) {
+  const t = String(text || "").replace(/<think>[\s\S]*?<\/think>/g, "").replace(/```(json)?/g, "");
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  return JSON.parse(t.slice(a, b + 1).replace(/,\s*([}\]])/g, "$1"));
+}
+let lastReport = null;
+async function generateFeedback() {
+  showTab("feedback");
+  const body = $("fbBody");
+  const said = transcript.filter((t) => t.who === "Candidate").map((t) => t.text).join(" ");
+  const words = (said.match(/[A-Za-z']{2,}/g) || []).length;
+  if (words < 25) {
+    body.innerHTML = `<p class="hint">Not enough of your answers to evaluate (${words} words). Answer a few questions, then end the interview to get feedback.</p>`;
+    setStatus("Interview ended — not enough answers for feedback"); return;
+  }
+  body.innerHTML = '<p class="hint">Scoring your answers against the rubric… (the deeper model can take 20-60 s)</p>';
+  const text = feedbackTranscript(transcript);
+  const opts = { minutesUsed: interviewClock.minutes(), history: adaptOn() ? briefText(learnerBrief()) : "" };
+  let res = await complete(buildFeedbackPrompt(setup, text, opts)), report;
+  if (res.error) {
+    body.textContent = "Feedback could not be generated: " + res.error + ". Check the feedback model in Setup and try again.";
+    setStatus("Feedback unavailable — transcript retained"); return;
+  }
+  try { if (res.error) throw new Error(res.error); report = parseJSON(res.text); }
+  catch (e) {   // one retry: small models sometimes break the JSON
+    res = await complete(buildFeedbackPrompt(setup, text, opts) + "\n\nYour previous reply was not valid JSON. Reply with the JSON object only.");
+    if (res.error) {
+      body.textContent = "Feedback retry failed: " + res.error;
+      setStatus("Feedback unavailable — transcript retained"); return;
+    }
+    try { report = parseJSON(res.text); } catch { body.innerHTML = ""; body.append(Object.assign(document.createElement("pre"), { textContent: res.text || res.error })); setStatus("Feedback ready (unformatted)"); return; }
+  }
+  verifyReport(report, transcript);   // flag any quoted evidence the candidate never actually said
+  // A report whose evidence can't be found in what you said can't recommend hiring.
+  const scored = (report.scores || []).filter((s) => Number.isFinite(+s.score) && +s.score >= 1 && +s.score <= 4);
+  const verified = scored.filter((s) => s.verified).length;
+  if (!scored.length) {
+    report.recommendation = "Insufficient evidence";
+    report.summary = "The interview did not provide enough evidence to assess the rubric. Try a longer practice session with questions across more of the role's requirements. " + (report.summary || "");
+  } else if (verified === 0) {
+    report.recommendation = "Insufficient evidence";
+    report.summary = "None of the quoted evidence for scored criteria could be found in your answers, so this report is not reliable. " +
+      "Try another practice session with fuller answers. Model's summary: " + (report.summary || "");
+  } else if (verified < scored.length / 2 && /strong evidence|good evidence/i.test(report.recommendation || "")) {
+    report.recommendation = "Limited evidence";
+  } else if ((report.scores || []).length && scored.length < (report.scores || []).length / 2 && /strong evidence|good evidence/i.test(report.recommendation || "")) {
+    report.recommendation = "Limited evidence";
+  }
+  report.progressDeltas = adaptOn() ? progress(report, undefined, setup) : null;   // compare only with the same role, level, type and rubric
+  lastReport = { report, transcript: text, when: new Date() };
+  if (!lastReport.saved) {   // regenerating replaces the stored report of the same session
+    lastReport.saved = saveSession({ when: Date.now(), mode: wasDemo ? "demo" : "interview", setup: snapshotSetup(),
+      minutes: interviewClock.minutes(), transcript: transcript.map((t) => ({ who: t.who, text: t.text })), report });
+    sessionId = lastReport.saved;
+  } else { deleteSession(sessionId); saveSession({ id: sessionId, when: Date.now(), mode: wasDemo ? "demo" : "interview", setup: snapshotSetup(),
+      minutes: interviewClock.minutes(), transcript: transcript.map((t) => ({ who: t.who, text: t.text })), report }); }
+  renderHistory();
+  renderReport(report, transcript, interviewClock.minutes()); setStatus("Feedback ready");
+}
+let sessionId = null, wasDemo = false;
+const adaptOn = () => (setup.adapt || "on") !== "off";
+const snapshotSetup = () => ({ role: setup.role, seniority: setup.seniority, company: setup.company, type: setup.type, minutes: setup.minutes, candidate: setup.candidate, rubric: setup.rubric });
+const esc = (x) => String(x ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+function renderReport(r, turns = transcript, minutes = interviewClock.minutes(), isDemo = wasDemo) {
+  const rec = String(r.recommendation || "");
+  const d = r.progressDeltas, delta = (c) => { const v = d?.deltas?.[c]; return v == null ? "" : `<span class="delta ${v > 0 ? "up" : v < 0 ? "down" : ""}" title="same role, level, interview type and rubric; question differences can affect the score">${v > 0 ? "▲ +" + v : v < 0 ? "▼ " + v : "= same"}</span>`; };
+  const cls = /limited|insufficient/i.test(rec) ? "neg" : /mixed/i.test(rec) ? "mid" : "";
+  const list = (xs) => `<ul>${(xs || []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`;
+  $("fbBody").innerHTML = `
+    <div><span class="muted">Practice signal:</span> <span class="rec ${cls}">${esc(rec || "No signal")}</span>${d ? ` <span class="muted">previous: ${esc(d.prevRecommendation || "")}${d.prevAvg ? `, avg ${d.prevAvg.toFixed(1)}` : ""} → avg ${(avgScore(r) || 0).toFixed(1)}</span>` : ""}</div>
+    ${isDemo ? '<p class="hint">This report describes the simulated AI candidate, not your interview performance. Treat its answer as one example and verify every detail.</p>' : ""}
+    <p>${esc(r.summary)}</p>
+    ${r.progress ? `<p><b>Progress:</b> ${esc(r.progress)}</p>` : ""}
+    <h3>Scores</h3>
+    ${(r.scores || []).map((s) => { const observed = s.evidence_status !== "not_observed" && s.score != null && Number.isFinite(+s.score) && +s.score >= 1 && +s.score <= 4; return `<div class="score"><b>${esc(s.criterion)}</b> ${observed ? `<span class="dots">${"●".repeat(+s.score)}${"○".repeat(4 - (+s.score))}</span> ${esc(s.score)}/4 ${delta(s.criterion)}` : '<span class="muted">Not observed</span>'}
+      ${observed && !s.verified ? '<span class="unv" title="No quoted evidence could be found in the transcript">unverified</span>' : ""}
+      ${(s.checked || []).map((c) => `<blockquote class="${c.ok ? "ok" : "bad"}" title="${c.ok ? "Found in the transcript" : "Not found in the transcript - treat with caution"}">${c.ok ? "✓" : "⚠"} “${esc(c.q)}”${c.ok ? "" : " <i>(not found in transcript)</i>"}</blockquote>`).join("")}
+      <p>${esc(s.assessment || s.evidence || "")}</p>${s.improve ? `<p><i>To improve:</i> ${esc(s.improve)}</p>` : ""}${s.example_rewrite ? `<div class="rewrite-box"><b>Coached 4/4 rewrite:</b> ${esc(s.example_rewrite)}</div>` : ""}</div>`; }).join("")}
+    <h3>Strengths</h3>${list(r.strengths)}
+    <h3>Improvements</h3>${list(r.improvements)}
+    <h3>Practise next</h3>${list(r.practice_questions)}
+    <details class="tx"><summary>Transcript (${turns.length} turns${minutes ? `, ${Math.round(minutes)} min` : ""})</summary>
+      ${turns.map((t) => `<p><b class="${t.who === "Interviewer" ? "ai" : ""}">${t.who === "Candidate" ? (isDemo ? "AI candidate" : "You") : "Interviewer"}:</b> ${esc(t.text)}</p>`).join("")}</details>`;
+  $("fbDownload").hidden = $("fbRegen").hidden = false;
+  const hasDrillTarget = (r.practice_questions || []).length > 0 || (r.scores || []).some((s) => s.score != null && +s.score <= 3);
+  $("fbDrill").hidden = !hasDrillTarget;
+}
+function renderHistory() {
+  updateTabs();
+  const list = loadHistory().slice().reverse();
+  $("histCount").textContent = list.length ? `(${list.length})` : "";
+  $("histList").innerHTML = list.length ? list.map((s) => `<div class="hist" data-id="${s.id}">
+      <span>${new Date(s.when).toLocaleString()}</span> <span>${esc(`${s.setup?.seniority || ""} ${s.setup?.role || "role unspecified"}`.trim())}</span>
+      <span>${s.mode === "demo" ? "AI demo" : esc(s.report?.recommendation || "")}${avgScore(s.report) ? ` · avg ${avgScore(s.report).toFixed(1)}` : ""}${s.minutes ? ` · ${Math.round(s.minutes)} min` : ""}</span>
+      <button type="button" class="open">Open</button><button type="button" class="del" title="Delete">✕</button></div>`).join("") : '<p class="hint">No interviews stored yet.</p>';
+  $("histList").querySelectorAll(".open").forEach((b) => (b.onclick = () => {
+    const s = loadHistory().find((x) => x.id === b.parentElement.dataset.id); if (!s) return;
+    lastReport = { report: s.report || {}, transcript: feedbackTranscript(s.transcript || []), when: new Date(s.when), saved: s.id };
+    if (s.report) renderReport(s.report, s.transcript || [], s.minutes, s.mode === "demo"); else { $("fbBody").innerHTML = `<p class="hint">AI demo (no report).</p>` + (s.transcript || []).map((t) => `<p><b class="${t.who === "Interviewer" ? "ai" : "cand"}">${t.who === "Candidate" ? "AI candidate" : "Interviewer"}:</b> ${esc(t.text)}</p>`).join(""); $("fbDrill").hidden = $("fbDownload").hidden = true; }
+    $("fbRegen").hidden = true; $("fbBody").scrollIntoView({ behavior: "smooth" });
+  }));
+  $("histList").querySelectorAll(".del").forEach((b) => (b.onclick = () => { deleteSession(b.parentElement.dataset.id); renderHistory(); }));
+}
+$("histClear").onclick = () => { if (confirm("Delete all stored interviews from this browser?")) { clearHistory(); renderHistory(); } };
+$("histExport").onclick = () => {
+  const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(new Blob([JSON.stringify(loadHistory(), null, 1)], { type: "application/json" })),
+    download: `interview-history-${new Date().toISOString().slice(0, 10)}.json` });
+  a.click(); URL.revokeObjectURL(a.href);
+};
+renderHistory();
+$("fbRegen").onclick = () => generateFeedback();
+$("fbDrill").onclick = () => {
+  const r = lastReport?.report; if (!r || running) return;
+  const weak = (r.scores || [])
+    .filter((s) => s.evidence_status !== "not_observed" && s.score != null && Number.isFinite(+s.score) && +s.score <= 3)
+    .sort((a, b) => +a.score - +b.score)
+    .slice(0, 3);
+  const qs = (r.practice_questions || []).filter(Boolean).slice(0, 4);
+  setup.minutes = 5;
+  if (weak.length) setup.focus = weak.map((w) => w.criterion).join(", ");
+  if (qs.length) setup.customQuestions = qs.join("\n");
+  saveSetup(setup); fillForm(); sendConfig(); showTab("chat");
+  $("start").click();
+};
+$("fbDownload").onclick = () => {
+  if (!lastReport) return;
+  const r = lastReport.report, md = [
+    `# Interview feedback — ${setup.seniority} ${setup.role}${setup.company ? " @ " + setup.company : ""}`,
+    `_${lastReport.when.toLocaleString()}_`, "", `**Practice signal:** ${r.recommendation}`, "", r.summary, "", "## Scores",
+    ...(r.scores || []).map((s) => `### ${s.criterion} — ${s.score == null || s.evidence_status === "not_observed" ? "Not observed" : `${s.score}/4${s.verified ? "" : " (unverified)"}`}\n` +
+      (s.checked || []).map((c) => `> ${c.ok ? "✓" : "⚠ (not found in transcript)"} "${c.q}"`).join("\n") +
+      `\n\n${s.assessment || s.evidence || ""}${s.improve ? `\n\n- **To improve:** ${s.improve}` : ""}${s.example_rewrite ? `\n\n- **Coached 4/4 rewrite:** ${s.example_rewrite}` : ""}`),
+    "", "## Strengths", ...(r.strengths || []).map((x) => `- ${x}`), "", "## Improvements", ...(r.improvements || []).map((x) => `- ${x}`),
+    "", "## Practise next", ...(r.practice_questions || []).map((x) => `- ${x}`), "", "## Transcript", "", lastReport.transcript,
+  ].join("\n");
+  const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(new Blob([md], { type: "text/markdown" })),
+    download: `interview-feedback-${lastReport.when.toISOString().slice(0, 10)}.md` });
+  a.click(); URL.revokeObjectURL(a.href);
+};
+
+// ---------------------------------------------------------------- AI demo: watch an AI candidate
+// The interviewer runs a normal interview; after each of his turns finishes playing, an AI candidate (LLM with
+// your resume/JD) answers in a different voice; its answer is then sent to the interviewer as the candidate's turn.
+const demo = {
+  on: false, replyComplete: false, busy: false, turn: 0, answered: -1,   // one AI answer per interviewer turn
+  voice() { const v = setup.voice || avatarMeta(setup.avatar).voice; return /^af_|^bf_/.test(v) ? "am_adam" : "af_heart"; },
+  // deterministic close: generate just the goodbye (acknowledging the last answer), the avatar says it, then hang up
+  async closeNow() {
+    if (this.closing || !this.on || !running) return;
+    this.closing = true; setStatus("Wrapping up…");
+    const text = feedbackTranscript(transcript).replace(/^\[C\d+\] /gm, "");
+    const bye = String((await complete(buildClosingPrompt(setup, text), false)).text || "")
+      .replace(/<think>[\s\S]*?<\/think>/g, "").replace(/\[\w+\]/g, "").replace(/[^.!]*\?\s*/g, "").replace(/\s+/g, " ").trim()
+      || "Thanks so much for your time today. Our recruiter will be in touch within the week. Take care!";
+    if (!this.on || !running) return;
+    hangUpAfterAudio = true;
+    send({ type: "speak", role: "interviewer", text: bye });
+  },
+  replyStarted() { if (this.replyComplete || this.turn === 0) this.turn++; this.replyComplete = false; },
+  replyDone() { this.replyComplete = true; if (!current && !queue.length) this.played(false); },
+  async played(wasCandidate) {
+    if (!this.on || !running) return;
+    if (wasCandidate) {                             // AI candidate finished speaking -> hand the answer to the interviewer
+      const ans = this.answer; this.answer = null;
+      // time's up and this was the answer to the last question: the interviewer acknowledges it and closes
+      if (interviewClock.overtime() && this.overTurns >= 1) return this.closeNow();
+      if (ans) { setStatus("Interviewer is thinking…"); this.sent = ans; send({ type: "text", text: ans }); }
+      return;
+    }
+    if (!this.replyComplete || this.busy || this.answered === this.turn) return;   // still speaking / already answered
+    // Time's up and he finished a reply without hanging up: ask him directly to close (goodbye + [end]) instead of
+    // letting the AI candidate keep the conversation going. Hard cut only if even that doesn't end the call.
+    // he already said goodbye ("the recruiter will be in touch...") without [end]: hang up, don't close a second time
+    const lastI = transcript.at(-1)?.who === "Interviewer" ? transcript.at(-1).text : "";
+    if (/\bbe in touch\b|\bnext steps?\b|\bgoodbye\b|\bthank you for your time\b/i.test(lastI) && !/\?\s*$/.test(lastI)) { hangUp(); return; }
+    if (interviewClock.overtime()) {
+      this.overTurns = (this.overTurns || 0) + 1;
+      if (this.overTurns > 3) { hangUp(); return; }
+      // a question is pending when time runs out: let the candidate answer it (then closeNow); otherwise close now
+      const pendingQuestion = /\?\s*$/.test(transcript.at(-1)?.who === "Interviewer" ? transcript.at(-1).text : "");
+      if (!pendingQuestion && transcript.some((t) => t.who === "Candidate")) return this.closeNow();
+    }
+    this.busy = true; this.answered = this.turn; setStatus("AI candidate is thinking…");
+    const text = feedbackTranscript(transcript).replace(/^\[C\d+\] /gm, "");
+    const words = (x) => new Set(x.toLowerCase().match(/[a-z']{3,}/g) || []);
+    const sameAsBefore = (a) => { const w = words(a); return transcript.some((t) => t.who === "Candidate" && t.text.length > 20 && (() => {
+      const p = words(t.text); let n = 0; for (const x of w) if (p.has(x)) n++; return n / Math.max(1, Math.min(w.size, p.size)) > 0.85; })()); };
+    const coaching = adaptOn() ? learnerBrief() : null;
+    let rawRes = await complete(buildCandidatePrompt(setup, text, { coaching }), false);
+    let parsed = parseDemoAnswer(rawRes.text || "");
+    let ans = parsed.spoken;
+    if (ans && sameAsBefore(ans)) {                 // loop guard: regenerate once, then stop the demo
+      rawRes = await complete(buildCandidatePrompt(setup, text, { coaching }) + "\n\nYour draft repeated an earlier answer. Say something NEW that responds to the interviewer's last message.", false);
+      parsed = parseDemoAnswer(rawRes.text || "");
+      ans = parsed.spoken;
+      if (ans && sameAsBefore(ans)) { this.busy = false; setStatus("AI demo stopped: the candidate started repeating itself"); endInterview(); return; }
+    }
+    // too long or invented numbers (the model ignores both rules in the prompt): regenerate once with the problems
+    // named; if it is still too long, keep whole sentences up to the limit
+    let issues = ans ? demoAnswerIssues(ans, setup, text) : [];
+    if (issues.length && this.on && running) {
+      const retry = await complete(buildCandidatePrompt(setup, text, { coaching }) + "\n\nYour draft answer was:\n" + (rawRes.text || "") +
+        "\n\nProblems: " + issues.join("; ") + ". Rewrite it fixing these, in the same output format.", false);
+      const p2 = parseDemoAnswer(retry.text || "");
+      if (p2.spoken && !sameAsBefore(p2.spoken)) { rawRes = retry; parsed = p2; ans = p2.spoken; }
+      if (ans && demoAnswerIssues(ans, setup, text).some((x) => x.includes("words;"))) { parsed = parseDemoAnswer(clipDemoRaw(rawRes.text || "")); ans = parsed.spoken; }
+    }
+    this.busy = false;
+    if (!this.on || !running) return;
+    if (!ans) { setStatus("AI candidate failed to answer: " + (rawRes.error || "empty reply")); return; }
+    this.answer = ans;
+    addLine('<b class="cand">AI candidate:</b> ' + parsed.annotatedHtml);
+    if (parsed.coachNote) {
+      const c = addLine('<b>💡 Coach Note:</b> ');
+      c.className = "coach-note";
+      c.append(parsed.coachNote);
+    }
+    transcript.push(lastTurn = { who: "Candidate", text: ans });
+    setStatus("AI candidate is answering…");
+    send({ type: "speak", text: ans, voice: this.voice() });
+  },
+};
+$("demo").onclick = async () => {
+  if (running) return;
+  demo.on = true; demo.replyComplete = false; demo.answer = null; demo.turn = 0; demo.answered = -1; demo.overTurns = 0; demo.closing = false;
+  $("demo").disabled = true;
+  let note = "";
+  if (!setup.resume && !setup.jd) {                   // nothing set up: the demo loads the selected scenario preset
+    try { await loadScenarioPreset(setup.scenarioPreset || "payments-backend"); note = `Demo loaded the "${SCENARIO_PRESETS[setup.scenarioPreset || "payments-backend"]?.label || "sample"}" scenario. Paste your own resume and JD in Setup to watch answers tailored to your background.`; }
+    catch (e) { note = `Could not load the sample setup (${e.message}); the AI candidate will invent a background.`; }
+  }
+  if (micOn) await setMic(false);
+  await $("start").onclick();                         // normal start (loads browser models if needed); it clears the log
+  if (note) addLine('<span class="muted"></span>').querySelector("span").textContent = note;
+  if (micOn) await setMic(false);                     // the AI answers - keep your mic out of it
+};
+
+// ---------------------------------------------------------------- interview setup tab
+let setup = loadSetup();
+const form = $("setup");
+function sendConfig() {
+  // in-browser engine: smaller model + GPU limits -> compact context (shorter prefill, faster first reply)
+  const maxDoc = engineKind === "browser" ? 2500 : 6000;
+  const meta = avatarMeta(setup.avatar);
+  const voice = setup.voice || meta.voice;
+  const brief = adaptOn() ? learnerBrief() : null;
+  // the AI demo is for learning: steer it to the questions the learner should practise, so the candidate shows them
+  const coachQs = demo.on && brief ? brief.practice.slice(0, 3).map((q) => ({ q, when: "early" })) : [];
+  const planned = [...coachQs.map((x) => x.q), ...(setup.customQuestions || "").split("\n").map((x) => x.trim()).filter(Boolean).slice(0, 8), ...bankQuestions.map((x) => x.q)];
+  const promptSetup = { ...setup, interviewer: effectiveInterviewer(setup) };
+  engine?.send({ type: "config", minutes: +setup.minutes || 10, kind: setup.type, questions: planned, no_resume: !setup.resume,
+                 system: buildSystemPrompt(promptSetup, { maxDoc, questions: [...coachQs, ...bankQuestions], history: briefText(brief) }), model: setup.model, patience: setup.patience, voice,
+                 tts: setup.ttsProvider || "kokoro", vocabulary: sttVocabulary(promptSetup) });
+}
+function syncAvatarUi() {
+  const meta = avatarMeta(setup.avatar);
+  $("name").textContent = `${effectiveInterviewer(setup)} · Interviewer`;
+  form.elements.interviewer.placeholder = meta.interviewer;
+  const defVoiceOpt = form.elements.voice.querySelector('option[value=""]');
+  const matchedVoice = form.elements.voice.querySelector(`option[value="${meta.voice}"]`)?.textContent;
+  if (defVoiceOpt) defVoiceOpt.textContent = matchedVoice ? `Avatar default (${matchedVoice})` : "Avatar default";
+}
+function syncInterviewerToAvatar() {
+  const cur = (setup.interviewer || "").trim();
+  if (!cur || DEFAULT_INTERVIEWER_NAMES.has(cur)) {
+    setup.interviewer = avatarMeta(setup.avatar).interviewer;
+    if (form.elements.interviewer) form.elements.interviewer.value = setup.interviewer;
+  }
+}
+function fillForm() { for (const el of form.elements) if (el.name && el.name in setup) el.value = setup[el.name]; syncAvatarUi(); }
+function readForm() {
+  for (const el of form.elements) if (el.name && el.name in setup) setup[el.name] = el.type === "number" ? +el.value || setup[el.name] : el.value;
+  saveSetup(setup);
+}
+function showTab(name) {
+  if (running && name !== "chat") name = "chat";
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("on", b.dataset.tab === name));
+  form.hidden = name !== "setup"; $("chat").hidden = name !== "chat"; $("feedback").hidden = name !== "feedback";
+}
+document.querySelectorAll(".tab").forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
+// Changing where the AI runs (or the in-browser model) restarts the page on step 1 with the new engine
+for (const name of ["engine", "browserLlm"]) form.elements[name].addEventListener("change", () => {
+  if (running) return;
+  readForm();
+  try { sessionStorage.setItem("ai-avatar.reopen", "setup"); } catch {}
+  const u = new URL(location); u.searchParams.delete("engine"); if (name === "browserLlm") u.searchParams.delete("llm"); location = u;
+});
+updateTabs();
+const reopen = (() => { try { const v = sessionStorage.getItem("ai-avatar.reopen"); sessionStorage.removeItem("ai-avatar.reopen"); return v; } catch { return null; } })();
+if (firstVisit || reopen === "setup") showTab("setup");
+form.oninput = () => { readForm(); syncAvatarUi(); sendConfig(); if (rig) rig.lipsync = setup.lipsync; };
+form.onsubmit = (e) => { e.preventDefault(); readForm(); $("start").click(); };
+$("previewPrompt").onclick = () => { readForm(); const p = $("promptPreview"); p.hidden = !p.hidden; p.textContent = buildSystemPrompt({ ...setup, interviewer: effectiveInterviewer(setup) }, { maxDoc: engineKind === "browser" ? 2500 : 6000, questions: bankQuestions }); };
+async function fileToText(file) {
+  if (!/\.pdf$/i.test(file.name)) return file.text();
+  const pdfjs = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@6.4.299/build/pdf.min.mjs");
+  pdfjs.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.4.299/build/pdf.worker.min.mjs";
+  const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+  let text = "";
+  for (let i = 1; i <= doc.numPages; i++) text += (await (await doc.getPage(i)).getTextContent()).items.map((it) => it.str).join(" ") + "\n";
+  return text.replace(/[ \t]+/g, " ").trim();
+}
+form.querySelectorAll("input[type=file]").forEach((inp) => (inp.onchange = async () => {
+  const file = inp.files[0]; if (!file) return;
+  const ta = form.elements[inp.dataset.target];
+  ta.value = "Reading " + file.name + "…";
+  try { ta.value = await fileToText(file); } catch (e) { ta.value = ""; alert("Could not read " + file.name + ": " + (e?.message || e)); }
+  readForm(); sendConfig();
+}));
+form.elements.rubricPreset.innerHTML = Object.entries(RUBRIC_PRESETS).map(([k, r]) => `<option value="${k}">${esc(r.label)}</option>`).join("");
+if (!RUBRIC_PRESETS[setup.rubricPreset]) setup.rubricPreset = "general";
+form.elements.rubricPreset.addEventListener("change", () => {
+  const key = form.elements.rubricPreset.value;
+  setup.rubricPreset = key;
+  if (RUBRIC_PRESETS[key]) {
+    setup.rubric = RUBRIC_PRESETS[key].text;
+    form.elements.rubric.value = setup.rubric;
+  }
+  saveSetup(setup); sendConfig();
+});
+
+$("scenarioPick").innerHTML = Object.entries(SCENARIO_PRESETS).map(([k, p]) => `<option value="${k}">${esc(p.label)}</option>`).join("");
+if (!SCENARIO_PRESETS[setup.scenarioPreset]) setup.scenarioPreset = "payments-backend";
+$("scenarioPick").value = setup.scenarioPreset;
+
+async function loadScenarioPreset(key = $("scenarioPick").value || "payments-backend") {
+  const p = SCENARIO_PRESETS[key] || SCENARIO_PRESETS["payments-backend"];
+  let { jd, resume, ats } = p;
+  if (p.useSampleFiles) {
+    try {
+      const get = (n) => fetch(`samples/${n}`).then((r) => (r.ok ? r.text() : Promise.reject(new Error(r.status))));
+      [jd, resume, ats] = await Promise.all([get("jd-senior-backend-payments.md"), get("resume-sam-lee.md"), get("ats-report-sample.md")]);
+    } catch {}
+  }
+  const rubricPreset = p.rubricPreset || "general";
+  const rubric = RUBRIC_PRESETS[rubricPreset]?.text || setup.rubric;
+  Object.assign(setup, {
+    scenarioPreset: key,
+    candidate: p.candidate, role: p.role, seniority: p.seniority, company: p.company,
+    type: p.type, difficulty: p.difficulty, style: p.style, minutes: p.minutes || 10,
+    rubricPreset, rubric, focus: p.focus, customQuestions: p.customQuestions || "",
+    jd, resume, ats, notes: "",
+  });
+  $("scenarioPick").value = key;
+  saveSetup(setup); renderBankCats(); drawBankQuestions(); fillForm(); sendConfig();
+}
+$("scenarioPick").addEventListener("change", () => loadScenarioPreset($("scenarioPick").value));
+$("loadSample").onclick = () => loadScenarioPreset($("scenarioPick").value);
+// question bank: category checkboxes + a fresh random draw per interview
+let bankQuestions = [];
+const bankCats = () => setup.bankCategories || DEFAULT_CATEGORIES[setup.type] || DEFAULT_CATEGORIES.mixed;
+function drawBankQuestions() {
+  // the in-browser 1.5B model gets a shorter list (prompt length / GPU limits)
+  const n = Math.min(+setup.bankCount || 0, engineKind === "browser" ? 2 : 8);
+  bankQuestions = n > 0 ? pickQuestions(bankCats(), n) : [];
+}
+function renderBankCats() {
+  const on = new Set(bankCats());
+  $("bankCats").innerHTML = Object.entries(QUESTION_CATEGORIES).map(([k, c]) =>
+    `<label title="${c.questions.length} questions, asked ${c.when}"><input type="checkbox" value="${k}" ${on.has(k) ? "checked" : ""}> ${c.label}</label>`).join("");
+}
+$("bankCats").addEventListener("change", (e) => {
+  e.stopPropagation();
+  setup.bankCategories = [...$("bankCats").querySelectorAll("input:checked")].map((x) => x.value);
+  saveSetup(setup); drawBankQuestions(); sendConfig();
+});
+form.elements.type.addEventListener("change", () => { if (!setup.bankCategories) renderBankCats(); });
+renderBankCats(); drawBankQuestions();
+
+// avatar selector: populate, honour ?avatar=, switch live
+form.elements.avatar.innerHTML = Object.entries(AVATARS).map(([k, a]) => `<option value="${k}">${a.label}</option>`).join("");
+if (AVATARS[params.get("avatar")]) { setup.avatar = params.get("avatar"); syncInterviewerToAvatar(); }
+if (!AVATARS[setup.avatar]) { setup.avatar = DEFAULT_AVATAR; syncInterviewerToAvatar(); }   // removed options -> default
+// one-time sync of earlier default interviewer name ("Alex") to match the avatar's gender/default
+if (!setup.avatarDefault3) syncInterviewerToAvatar();
+setup.avatarDefault2 = true; setup.avatarDefault3 = true; saveSetup(setup);
+let shownAvatar = setup.avatar;
+form.elements.avatar.addEventListener("change", () => {
+  if (setup.avatar !== shownAvatar) {
+    shownAvatar = setup.avatar;
+    syncInterviewerToAvatar();
+    saveSetup(setup);
+    syncAvatarUi();
+    sendConfig();
+    loadAvatar(avatarUrl(setup.avatar));
+  }
+});
+fillForm();
+// Option 1 (Photoreal) stays selectable even before its GPU service is up (it takes ~1.5 min to start): the client
+// shows an "offline - retrying" note and connects once the service answers. Start interview checks it (preflight).
+loadAvatar(avatarUrl(setup.avatar));
+
+// ---------------------------------------------------------------- open mic: stream 16 kHz int16 PCM
+let micOn = false, micStream, micSrc, micNode, micCarry = new Float32Array(0);
+async function setMic(on) {
+  const ctx = ensureAudio(); await ctx.resume();
+  if (on && !micStream) {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    } catch (e) { setStatus("Microphone blocked: " + e.message); return; }
+  }
+  if (on) {
+    micSrc = ctx.createMediaStreamSource(micStream);
+    micNode = ctx.createScriptProcessor(2048, 1, 1);        // ~43 ms chunks at 48 kHz
+    micNode.onaudioprocess = (e) => {
+      if (!engine) return;
+      const x = e.inputBuffer.getChannelData(0), ratio = ctx.sampleRate / 16000;
+      const all = new Float32Array(micCarry.length + x.length); all.set(micCarry); all.set(x, micCarry.length);
+      const n = Math.floor(all.length / ratio), out = new Int16Array(n);
+      for (let i = 0; i < n; i++) {                          // box-filter decimation to 16 kHz
+        const a = Math.floor(i * ratio), b = Math.floor((i + 1) * ratio); let s = 0;
+        for (let j = a; j < b; j++) s += all[j];
+        out[i] = Math.max(-1, Math.min(1, s / (b - a))) * 32767;
+      }
+      micCarry = all.slice(Math.floor(n * ratio));
+      engine.sendAudio(out.buffer);
+    };
+    micSrc.connect(micNode); micNode.connect(ctx.destination);
+  } else {
+    micNode?.disconnect(); micSrc?.disconnect(); micNode = micSrc = null;
+    $("mic").classList.remove("hearing"); if (rig) rig.userTalking = false;
+  }
+  micOn = on;
+  $("mic").classList.toggle("on", on);
+  $("micLabel").textContent = on ? "Mic on — just talk" : "Mic off";
+}
+$("mic").onclick = () => setMic(!micOn);
+addEventListener("keydown", (e) => { if (e.code === "KeyM" && e.target !== $("input")) setMic(!micOn); });
+</script>
+<dialog id="preflight" aria-labelledby="pfTitle">
+  <h2 id="pfTitle">Not ready yet</h2>
+  <ul id="pfList"></ul>
+  <div class="row"><button id="pfCancel" type="button">Cancel</button><button id="pfRetry" type="button">Check again</button><button id="pfGo" type="button">Start anyway</button></div>
+</dialog>
+</body>
+</html>
